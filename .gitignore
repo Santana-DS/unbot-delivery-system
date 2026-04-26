@@ -1,0 +1,36 @@
+# ─── FLUTTER & DART ──────────────────────────────────────────────────────────
+# https://github.com/github/gitignore/blob/main/Dart.gitignore
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+# Se você gerar o APK manualmente, não queremos que ele suba para o git
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# ─── PYTHON (BACKEND) ────────────────────────────────────────────────────────
+# https://github.com/github/gitignore/blob/main/Python.gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+.pytest_cache/
+
+# ─── EMBEDDED (ESP32 / ARDUINO / PLATFORMIO) ─────────────────────────────────
+# Se você for usar PlatformIO no VS Code
+.pio/
+.pioenvs/
+libdeps/
+
+# ─── IDE & SYSTEM ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+*.swp
+Thumbs.db
