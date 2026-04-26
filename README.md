@@ -80,7 +80,7 @@ graph TD
 4.  **Simule o Robô (Heartbeat):**
     Para habilitar o despacho no App, envie o sinal de vida do robô via PowerShell:
     ```bash
-    & 'C:\Program Files\mosquitto\mosquitto_pub.exe' -t "robot/status/heartbeat" -m "{\"status\": \"online\"}"
+     & 'C:\Program Files\mosquitto\mosquitto_pub.exe' -t "robot/status/heartbeat" -m "{\`"status\`": \`"online\`"}"
     ```
 5.  **Rode o App:**
     ```bash
