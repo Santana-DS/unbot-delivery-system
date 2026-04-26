@@ -17,7 +17,41 @@ O projeto opera em uma arquitetura distribuída e assíncrona, composta por quat
 | **Broker** | Mosquitto MQTT | Barramento de mensageria de baixa latência para comunicação com hardware. |
 | **Robô** | ESP32 / ROS 2 | Atuador físico, telemetria e interface ciber-física. |
 
-![Diagrama de Arquitetura](./docs/f1.png)
+```mermaid
+graph TD
+    subgraph App ["📱 1. Interface Mobile (App Flutter)"]
+        UI["Navegação e Rastreamento"]
+        Auth["Geração de Código OTP"]
+    end
+
+    subgraph Backend ["🧠 2. Gateway / Lógica (FastAPI / Python)"]
+        API["Servidor REST & WebSockets"]
+        Broker["Broker MQTT"]
+        API --- Broker
+    end
+
+    subgraph Computacional ["🗺️ 3. Alto Nível (ROS 2 / Raspberry Pi 3B)"]
+        Nav["Nav2 & SLAM (Pacotes C++)"]
+        EKF["robot_localization (C++)"]
+        Tele["Nó de Telemetria (Python)"]
+        Nav --- EKF
+        EKF --- Tele
+    end
+
+    subgraph Hardware ["⚙️ 4. Baixo Nível (ESP32 / Mecânica)"]
+        Micro["ESP32 com Micro-ROS"]
+        Atuadores["Motores & Trava Solenoide"]
+        Sensores["Odometria & Bateria"]
+        Micro --- Atuadores
+        Micro --- Sensores
+    end
+
+    UI <-->|"HTTP / WebSockets"| API
+    Auth -->|"Validação de Código"| API
+    Broker <-->|"MQTT"| Tele
+    Nav <-->|"Micro-ROS / UART"| Micro
+
+```
 
 ---
 
