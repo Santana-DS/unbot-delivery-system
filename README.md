@@ -124,10 +124,6 @@ flutter build apk --release
 ![Quadro Kanban](./docs/kanban.png)
 *Visão geral do progresso técnico e backlog do projeto.*
 
-* ✅ **Multi-Pedido:** Suporte a N pedidos ativos.
-* ✅ **Setup Dev Tunnels:** Integração mobile-local estável.
-* 🟡 **Identidade Visual:** Unificação UnB Navy/Glow Green (Em progresso).
-* 🚀 **Hardware:** Integração do Firmware ESP32 (Próximo marco).
 
 ---
 
