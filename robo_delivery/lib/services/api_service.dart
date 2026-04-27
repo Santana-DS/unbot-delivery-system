@@ -41,7 +41,10 @@ class ApiService {
       final response = await http
           .post(
             url,
-            headers: {"Content-Type": "application/json"},
+            headers: {
+              "Content-Type": "application/json",
+              "X-Tunnel-Skip-AntiPhishing-Page": "true" // Adicione esta linha
+            },
             body: jsonEncode({
               // order_id intentionally omitted from body — see FIX #6 above.
               "destination": {"x": 12.0, "y": -3.5},
@@ -84,7 +87,10 @@ class ApiService {
       final response = await http
           .post(
             url,
-            headers: {"Content-Type": "application/json"},
+            headers: {
+              "Content-Type": "application/json",
+              "X-Tunnel-Skip-AntiPhishing-Page": "true" // Adicione esta linha
+            },
             body: jsonEncode({
               "code": code,
               "order_id": orderId,
