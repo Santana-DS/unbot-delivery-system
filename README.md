@@ -1,7 +1,7 @@
 # 🤖 UnBot Delivery: Sistema de Logística Autônoma UnB
 
 <img src="./docs/banner.png" width="50%">
-*Placeholder para o Banner do Projeto: Sugestão de imagem com o logo do UnBot e as cores UnB Navy e Glow Green.*
+
 
 O **UnBot Delivery** é uma solução avançada de logística *last-mile* desenvolvida para o campus da Universidade de Brasília (UnB). O sistema integra tecnologias móveis, backend em nuvem e hardware ciber-físico distribuído, permitindo navegação autônoma com suporte a teleoperação de contingência em tempo real.
 
@@ -21,7 +21,7 @@ O projeto evoluiu para uma arquitetura distribuída e tolerante a falhas. Separa
 
 ### 🗺️ Topologia de Rede e Dados
 
-'''mermaid
+```mermaid
 graph TD
     subgraph Cloud ["☁️ 1. Infraestrutura em Nuvem (AWS/Oracle)"]
         API["Backend Gateway & Sinalização WebRTC (Go)"]
@@ -56,7 +56,7 @@ graph TD
     API -->|"Comandos"| Broker
     Broker -->|"Tópico: robot/commands/unlock"| ESP
     Pi -->|"Telemetria (Bateria/GPS)"| Broker
-'''
+```
 
 ---
 
