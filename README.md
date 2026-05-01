@@ -1,102 +1,100 @@
 # 🤖 UnBot Delivery: Sistema de Logística Autônoma UnB
 
 <img src="./docs/banner.png" width="50%">
+*Placeholder para o Banner do Projeto: Sugestão de imagem com o logo do UnBot e as cores UnB Navy e Glow Green.*
 
-O **UnBot Delivery** é uma solução avançada de logística *last-mile* desenvolvida para o campus da Universidade de Brasília (UnB). O sistema integra tecnologias móveis, backend escalável e hardware ciber-físico para permitir entregas autônomas e seguras.
+O **UnBot Delivery** é uma solução avançada de logística *last-mile* desenvolvida para o campus da Universidade de Brasília (UnB). O sistema integra tecnologias móveis, backend em nuvem e hardware ciber-físico distribuído, permitindo navegação autônoma com suporte a teleoperação de contingência em tempo real.
 
 ---
 
-## 🏗️ Arquitetura do Sistema
+## 🏗️ Arquitetura do Sistema (V2.0 - Teleoperação e Nuvem)
 
-O projeto opera em uma arquitetura distribuída e assíncrona, composta por quatro pilares fundamentais:
+O projeto evoluiu para uma arquitetura distribuída e tolerante a falhas. Separamos a camada de navegação pesada da camada de atuação crítica, utilizando cinco pilares fundamentais:
 
 | Entidade | Tecnologia | Função |
 | :--- | :--- | :--- |
-| **App Mobile** | Flutter | Interface do usuário e gerenciamento de pedidos via `ValueNotifier`. |
-| **Gateway** | FastAPI (Python) | Orquestrador lógico, segurança OTP e ponte de dados. |
-| **Broker** | Mosquitto MQTT | Barramento de mensageria de baixa latência para comunicação com hardware. |
-| **Robô** | ESP32 / ROS 2 | Atuador físico, telemetria e interface ciber-física. |
+| **App Mobile** | Flutter | UI de pedidos, rastreamento reativo e "Cockpit" de teleoperação (Joystick e Vídeo). |
+| **Gateway (Nuvem)** | Go (Golang) / Pion | Servidor de alta performance para validação OTP e sinalização WebRTC. |
+| **Broker (Nuvem)** | Mosquitto MQTT | Barramento seguro de baixa latência para comandos transacionais. |
+| **Cérebro (Robô)** | Notebook + ROS 2 | Processamento de Visão Computacional (ORB-SLAM3) e Navegação Autônoma. |
+| **Reflexos (Robô)**| RPi 3B + ESP32 | RPi para streaming de vídeo (WebRTC); ESP32 isolado para atuação da trava (MQTT). |
 
-```mermaid
+### 🗺️ Topologia de Rede e Dados
+
+'''mermaid
 graph TD
-    subgraph App ["📱 1. Interface Mobile (App Flutter)"]
-        UI["Navegação e Rastreamento"]
-        Auth["Geração de Código OTP"]
+    subgraph Cloud ["☁️ 1. Infraestrutura em Nuvem (AWS/Oracle)"]
+        API["Backend Gateway & Sinalização WebRTC (Go)"]
+        Broker["Broker MQTT (Mosquitto)"]
     end
 
-    subgraph Backend ["🧠 2. Gateway / Lógica (FastAPI / Python)"]
-        API["Servidor REST & WebSockets"]
-        Broker["Broker MQTT"]
-        API --- Broker
+    subgraph App ["📱 2. Interface Mobile (Flutter)"]
+        UI["App: Pedidos e Rastreamento"]
+        Teleop["App: Cockpit de Pilotagem (Vídeo + Joystick)"]
     end
 
-    subgraph Computacional ["🗺️ 3. Alto Nível (ROS 2 / Raspberry Pi 3B)"]
-        Nav["Nav2 & SLAM (Pacotes C++)"]
-        EKF["robot_localization (C++)"]
-        Tele["Nó de Telemetria (Python)"]
-        Nav --- EKF
-        EKF --- Tele
+    subgraph Computacional ["🧠 3. Alto Nível (Robô - Processamento)"]
+        Note["Notebook (ROS 2 / ORB-SLAM3)"]
+        Pi["Raspberry Pi 3B (Nó de Teleoperação)"]
+        CamUSB["Câmera USB (Visão SLAM)"] --> Note
+        CamPi["Câmera CSI (Vídeo Otimizado)"] --> Pi
     end
 
-    subgraph Hardware ["⚙️ 4. Baixo Nível (ESP32 / Mecânica)"]
-        Micro["ESP32 com Micro-ROS"]
-        Atuadores["Motores & Trava Solenoide"]
-        Sensores["Odometria & Bateria"]
-        Micro --- Atuadores
-        Micro --- Sensores
+    subgraph Hardware ["⚙️ 4. Baixo Nível (Atuadores Isolados)"]
+        ESP["ESP32 (Módulo Wi-Fi Independente)"]
+        Motor["Controladora de Motores (Ponte H)"]
+        Trava["Trava Solenoide (Marmita)"]
+        
+        ESP -->|"Relé"| Trava
+        Pi -->|"Sinal Serial / PWM"| Motor
+        Note <-->|"cmd_vel (Velocidade Autônoma)"| Motor
     end
 
-    UI <-->|"HTTP / WebSockets"| API
-    Auth -->|"Validação de Código"| API
-    Broker <-->|"MQTT"| Tele
-    Nav <-->|"Micro-ROS / UART"| Micro
-
-```
+    %% Conexões de Rede
+    UI <-->|"HTTP (Transações OTP)"| API
+    Teleop <-->|"WebRTC P2P (Vídeo H.264 e Joystick)"| Pi
+    API -->|"Comandos"| Broker
+    Broker -->|"Tópico: robot/commands/unlock"| ESP
+    Pi -->|"Telemetria (Bateria/GPS)"| Broker
+'''
 
 ---
 
-## 🚀 Guia de Setup e Execução
+## 🚀 Guia de Setup e Integração
 
 ### 📋 Pré-requisitos
 * **Flutter SDK (3.27+)**
-* **Python 3.10+**
-* **Mosquitto MQTT Broker**
-* **VS Code** (Extensões: Flutter, Dart, Python)
+* **Go (Golang 1.21+)** para o Backend V2.
+* **Ambiente Nuvem:** Instância EC2/Oracle com portas 1883 (MQTT) e 8080 (API) expostas.
+* **VS Code / PlatformIO** para o firmware do ESP32 em C++.
 
-### 🛠️ Passo a Passo para Desenvolvimento
+### 🛠️ Passos de Execução (Fase de Transição)
 
-1.  **Inicialize o Broker MQTT:**
-    ```bash
-    net start mosquitto
-    ```
-2.  **Inicie o Backend Gateway:**
-    Navegue até `/backend_gateway` e execute:
-    ```bash
-    pip install fastapi uvicorn paho-mqtt python-dotenv
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-    ```
-3.  **Configure o Túnel (Dev Tunnels):**
-    No VS Code, encaminhe a porta `8000`, mude para **Public** e cole o link gerado no `api_service.dart`.
-4.  **Simule o Robô (Heartbeat):**
-    Para habilitar o despacho no App, envie o sinal de vida do robô via PowerShell:
-    ```bash
-     & 'C:\Program Files\mosquitto\mosquitto_pub.exe' -t "robot/status/heartbeat" -m "{\`"status\`": \`"online\`"}"
-    ```
-5.  **Rode o App:**
-    ```bash
-    flutter pub get
-    flutter run
-    ```
+1.  **Subir a Infraestrutura na Nuvem:**
+    O Mosquitto e o Gateway em Go devem ser executados no servidor remoto para evitar que o notebook local atue como ponto único de falha.
+2.  **Firmware ESP32 (Trava de Segurança):**
+    O ESP32 deve ser programado com credenciais Wi-Fi (ou 4G do robô) e se subscrever ao tópico do Mosquitto na nuvem. *Nota: A trava operará de forma 100% independente do Raspberry Pi.*
+3.  **Configuração do WebRTC (Raspberry Pi):**
+    Conectar a Pi Camera Module (CSI). Iniciar o nó em Python/Go no Raspberry que aguarda a sinalização P2P para iniciar a transmissão de vídeo acelerada por hardware (H.264).
+4.  **Execução do App Mobile:**
+```bash
+flutter clean
+flutter pub get
+flutter run
+'''
 
 ---
 
-## 🔐 Lógica Técnica e Segurança
+## 🔐 Lógica Técnica e Segurança Transacional
 
-### Gerenciamento de Estado
-Utilizamos o padrão **Observer** com `ValueListenableBuilder` para garantir que a interface seja reativa a múltiplos pedidos simultâneos sem perda de performance.
+### Isolamento de Falhas (Fail-Safe)
+A arquitetura foi desenhada para garantir a integridade da entrega. O comando de abertura da trava viaja via MQTT da nuvem diretamente para o ESP32. Se o sistema de navegação (Notebook/ROS 2) falhar ou o robô colidir, o usuário ainda poderá utilizar o código OTP no aplicativo para resgatar sua marmita física.
 
 ### Protocolo Peek-and-Consume (OTP)
-A segurança da retirada baseia-se em um segredo criptográfico gerado via `secrets` (Python). O código só é validado após o Broker confirmar a entrega da mensagem MQTT ao hardware, garantindo a transacionalidade da entrega física.
+A senha criptográfica só é marcada como "usada" no banco de dados do Backend (Go) após o Broker MQTT confirmar a entrega da mensagem de acionamento ao microcontrolador ESP32.
+
+### Teleoperação de Baixa Latência
+Para auxiliar o robô em travessias complexas (como faixas de pedestres), o aplicativo estabelece uma ponte *Peer-to-Peer* com o Raspberry Pi via **WebRTC**. Os comandos do joystick virtual são enviados por *DataChannels* contornando o servidor, resultando em tempo de resposta em milissegundos.
 
 ---
 
@@ -104,7 +102,7 @@ A segurança da retirada baseia-se em um segredo criptográfico gerado via `secr
 
 Para gerar o executável de produção para Android, siga o procedimento de **Clean Build** para evitar corrupção de artefatos:
 
-```bash
+'''bash
 # 1. Limpeza profunda de cache
 flutter clean
 
@@ -113,20 +111,29 @@ flutter pub get
 
 # 3. Compilação Ahead-of-Time (AOT)
 flutter build apk --release
-```
+'''
 
 **⚠️ Importante:** O artefato final será gerado em `build/app/outputs/flutter-apk/app-release.apk`. Certifique-se de que o `AndroidManifest.xml` contenha as permissões de `INTERNET` e `usesCleartextTraffic="true"` para garantir a conectividade em modo Release.
 
 ---
 
-## 📊 Estado Atual (Kanban)
+## 📊 Estado Atual (Kanban de Sprints)
 
 ![Quadro Kanban](./docs/kanban.png)
 *Visão geral do progresso técnico e backlog do projeto.*
 
+| Sprint | Foco | Status |
+| :--- | :--- | :--- |
+| **V1.0** | App Base, Gateway Local, Multi-Pedido | ✅ Concluído |
+| **V2.0 - Sprint 1** | Migração Go, Nuvem MQTT, Firmware Trava ESP32 | 🟡 Em Andamento |
+| **V2.0 - Sprint 2** | WebRTC Raspberry Pi, Joystick Mobile e Vídeo | ⏳ Na Fila |
 
 ---
 
-## 🎓 Créditos
-Projeto desenvolvido como parte do **PIT (Projeto Integrador)** da **Faculdade de Tecnologia (FT)** - Engenharia Mecatrônica - Universidade de Brasília (UnB).
+## 🎓 Créditos e Equipe
+Projeto desenvolvido como parte do **Projeto Integrador de Tecnologias (PIT)** da **Faculdade de Tecnologia (FT)** - Engenharia Mecatrônica - Universidade de Brasília (UnB). 
 
+*Equipe distribuída entre as disciplinas de:*
+* Interface Mobile & Backend
+* Visão Computacional & Navegação Autônoma
+* Sistemas Embarcados & Eletrônica
