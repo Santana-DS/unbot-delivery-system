@@ -81,7 +81,7 @@ graph TD
 flutter clean
 flutter pub get
 flutter run
-'''
+```
 
 ---
 
@@ -102,7 +102,7 @@ Para auxiliar o robô em travessias complexas (como faixas de pedestres), o apli
 
 Para gerar o executável de produção para Android, siga o procedimento de **Clean Build** para evitar corrupção de artefatos:
 
-'''bash
+```bash
 # 1. Limpeza profunda de cache
 flutter clean
 
@@ -111,7 +111,7 @@ flutter pub get
 
 # 3. Compilação Ahead-of-Time (AOT)
 flutter build apk --release
-'''
+```
 
 **⚠️ Importante:** O artefato final será gerado em `build/app/outputs/flutter-apk/app-release.apk`. Certifique-se de que o `AndroidManifest.xml` contenha as permissões de `INTERNET` e `usesCleartextTraffic="true"` para garantir a conectividade em modo Release.
 
