@@ -116,7 +116,7 @@ class _CodeScreenState extends State<CodeScreen>
       // Async gap safety: widget may have been disposed during the await.
       if (!mounted) return;
 
-      if (sucesso) {
+      if (sucesso is UnlockSuccess) {
         // FIX #1 — remove from global notifier BEFORE updating local UI.
         // This ensures the home badge decrements atomically with the success
         // state, with no frame where the order appears both "used" and "active".

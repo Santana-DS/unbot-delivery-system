@@ -35,8 +35,7 @@
 // and api_service.dart — never active_order_state.dart. Clean DAG.
 
 import 'package:flutter/foundation.dart';
-import '../models/models.dart';
-import '../services/api_service.dart'; // for ActiveOrder type via active_order_state
+// for ActiveOrder type via active_order_state
 
 // Re-export ActiveOrder so callers only need one import if desired.
 // (ActiveOrder is defined in active_order_state.dart — we import it below

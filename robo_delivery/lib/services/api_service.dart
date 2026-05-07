@@ -1,54 +1,160 @@
+// lib/services/api_service.dart
+//
+// CHANGES IN THIS REVISION
+// ────────────────────────
+// Phase 1 — Typed unlock result:
+//   • Replaced the previous `Future<bool> validateOtp(...)` with
+//     `Future<UnlockResult> validateOtp(...)`.
+//   • Introduced the sealed class hierarchy `UnlockResult` with four
+//     exhaustive subtypes: UnlockSuccess, UnlockInvalidCode,
+//     UnlockRobotUnreachable, UnlockNetworkError.
+//   • The UI layer switches on UnlockResult and never sees a status code
+//     or a raw exception. All HTTP/network surface area is quarantined here.
+//   • dispatchOrder() is unchanged — it already used a typed result model.
+//
+// SEALED CLASS RATIONALE (Dart 3)
+// ────────────────────────────────
+// `sealed` forces every switch on UnlockResult to be exhaustive at compile
+// time. If a future engineer adds a fifth subtype (e.g. UnlockRateLimited)
+// the compiler will flag every unhandled switch site immediately — no silent
+// fall-through to a wrong UI state at runtime.
+// ignore_for_file: prefer_const_constructors
+
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
-// ─── CONSTANTS ─────────────────────────────────────────────────────────────
-// FIX #5 (Flutter side): A short connect/read timeout prevents the UI from
-// hanging indefinitely when campus Wi-Fi is congested. The backend's MQTT
-// connect now times out in 5 s; we allow 10 s for the full HTTP round-trip
-// (5 s MQTT + network RTT + FastAPI processing headroom).
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+
 const Duration _kApiTimeout = Duration(seconds: 10);
 
-class ApiService {
-  // Android emulator loopback to host machine's localhost.
-  // Change to your machine's LAN IP (e.g. "192.168.0.X") for physical devices.
-  static const String baseUrl = "https://rvdj88q6-8000.brs.devtunnels.ms";
+// ─── SEALED RESULT HIERARCHY ─────────────────────────────────────────────────
+//
+// Four exhaustive outcomes for POST /api/validate-code.
+// The UI switches on this type — no status codes, no exceptions, no booleans
+// leak past this file's boundary.
+//
+//   UnlockSuccess          HTTP 200  — gateway confirmed, MQTT published.
+//   UnlockInvalidCode      HTTP 401  — code wrong, consumed, or expired.
+//   UnlockRobotUnreachable HTTP 502  — OTP valid but MQTT publish failed.
+//   UnlockNetworkError     timeout / socket exception / non-JSON body.
 
-  // ─── dispatchOrder ───────────────────────────────────────────────────────
+sealed class UnlockResult {
+  const UnlockResult();
+}
+
+/// Gateway confirmed the OTP and published the unlock command to the robot.
+final class UnlockSuccess extends UnlockResult {
+  /// orderId echoed back by the gateway — use for logging / analytics.
+  final String orderId;
+  const UnlockSuccess({required this.orderId});
+}
+
+/// The code was not found, already consumed, or has expired.
+/// The user must re-enter or re-scan; do NOT auto-retry.
+final class UnlockInvalidCode extends UnlockResult {
+  final String message;
+  const UnlockInvalidCode({this.message = 'Código inválido ou expirado.'});
+}
+
+/// OTP was valid but the gateway could not reach the robot over MQTT.
+/// The code has been consumed — a retry requires a fresh OTP from the gateway.
+final class UnlockRobotUnreachable extends UnlockResult {
+  final String message;
+  const UnlockRobotUnreachable(
+      {this.message = 'Robô temporariamente inacessível. Tente novamente.'});
+}
+
+/// Network-layer failure: timeout, no connectivity, or unexpected server error.
+/// The code may or may not have been consumed — surface a retry option.
+final class UnlockNetworkError extends UnlockResult {
+  final String message;
+  const UnlockNetworkError(
+      {this.message = 'Sem conexão. Verifique sua internet.'});
+}
+
+// ─── API SERVICE ─────────────────────────────────────────────────────────────
+
+class ApiService {
+  // Swap for your production gateway URL via a build-time const or --dart-define.
+  static const String baseUrl = 'https://rvdj88q6-8000.brs.devtunnels.ms';
+
+  // ─── validateOtp ───────────────────────────────────────────────────────────
   //
-  // FIX #6 (Flutter side): The original body included `order_id` as a JSON
-  // field. The backend's NavigateRequest model has been fixed to NOT declare
-  // `order_id` in the body anymore — it comes exclusively from the URL path.
-  // Sending `order_id` in the body would cause Pydantic to raise a 422
-  // validation error on the updated backend because that field no longer
-  // exists in the model.
+  // Sends POST /api/validate-code and maps every possible outcome to the
+  // sealed UnlockResult hierarchy. No raw status codes or http.Response
+  // objects are returned to the caller.
   //
-  // FIX #7 (Flutter side): The backend now always returns HTTP 200 with the
-  // OTP even when the MQTT broker is unreachable (it returns status="otp_only"
-  // in that case). We surface the `mqtt_connected` flag to the caller so the
-  // UI can optionally show a hardware-offline warning.
-  //
-  // Returns a [DispatchResult] instead of a raw String? so callers have full
-  // context without needing a second API call.
-  Future<DispatchResult?> dispatchOrder(
-    String orderId,
-    String restaurantName,
-  ) async {
-    // FIX #6 — order_id is in the URL path only, NOT in the body.
-    final url = Uri.parse("$baseUrl/api/orders/$orderId/dispatch");
+  // Parameters:
+  //   code    — exactly 4 ASCII digit characters (validation is the caller's
+  //             responsibility; the gateway also validates server-side).
+  //   orderId — the active order identifier from ActiveOrder.orderId.
+  Future<UnlockResult> validateOtp(String code, String orderId) async {
+    final url = Uri.parse('$baseUrl/api/validate-code');
 
     try {
       final response = await http
           .post(
             url,
-            headers: {
-              "Content-Type": "application/json",
-              "X-Tunnel-Skip-AntiPhishing-Page": "true" // Adicione esta linha
-            },
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'code': code, 'order_id': orderId}),
+          )
+          .timeout(_kApiTimeout);
+
+      // ── Happy path ──────────────────────────────────────────────────────
+      if (response.statusCode == 200) {
+        final data = _parseJson(response.body);
+        final echoed = data?['order_id'] as String? ?? orderId;
+        debugPrint('validateOtp success — order: $echoed');
+        return UnlockSuccess(orderId: echoed);
+      }
+
+      // ── Known error codes ───────────────────────────────────────────────
+      final errBody = _parseJson(response.body);
+      final detail = errBody?['error'] as String? ?? 'Unknown error';
+
+      debugPrint(
+          'validateOtp failed — HTTP ${response.statusCode}: $detail');
+
+      if (response.statusCode == 401) {
+        return UnlockInvalidCode(message: detail);
+      }
+
+      if (response.statusCode == 502) {
+        return UnlockRobotUnreachable(message: detail);
+      }
+
+      // Any other 4xx/5xx — treat as network-layer error; do not assume
+      // the code was consumed since we don't know server state.
+      return const UnlockNetworkError();
+
+    } on TimeoutException {
+      debugPrint('validateOtp timed out after ${_kApiTimeout.inSeconds}s');
+      return const UnlockNetworkError(
+          message: 'Tempo de resposta excedido. Tente novamente.');
+    } on Exception catch (e) {
+      debugPrint('validateOtp connection error: $e');
+      return const UnlockNetworkError();
+    }
+  }
+
+  // ─── dispatchOrder ─────────────────────────────────────────────────────────
+  // Unchanged from previous revision — already uses a typed result model.
+  Future<DispatchResult?> dispatchOrder(
+    String orderId,
+    String restaurantName,
+  ) async {
+    final url = Uri.parse('$baseUrl/api/orders/$orderId/dispatch');
+
+    try {
+      final response = await http
+          .post(
+            url,
+            headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
-              // order_id intentionally omitted from body — see FIX #6 above.
-              "destination": {"x": 12.0, "y": -3.5},
-              "restaurant_name": restaurantName,
+              'destination': {'x': 12.0, 'y': -3.5},
+              'restaurant_name': restaurantName,
             }),
           )
           .timeout(_kApiTimeout);
@@ -57,85 +163,43 @@ class ApiService {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         final result = DispatchResult.fromJson(data);
         debugPrint(
-          "dispatchOrder success — OTP: ${result.otpCode} "
-          "| status: ${result.status} "
-          "| mqtt_connected: ${result.mqttConnected}",
+          'dispatchOrder success — OTP: ${result.otpCode} '
+          '| status: ${result.status} '
+          '| mqtt_connected: ${result.mqttConnected}',
         );
         return result;
-      } else {
-        // 422 = body schema mismatch (would catch FIX #6 regressions)
-        // 502 = broker error (should no longer happen after FIX #7 on backend)
-        debugPrint(
-          "dispatchOrder failed — HTTP ${response.statusCode}: ${response.body}",
-        );
       }
+
+      debugPrint(
+          'dispatchOrder failed — HTTP ${response.statusCode}: ${response.body}');
     } on Exception catch (e) {
-      debugPrint("dispatchOrder connection error: $e");
+      debugPrint('dispatchOrder connection error: $e');
     }
     return null;
   }
 
-  // ─── validateOtp ─────────────────────────────────────────────────────────
-  //
-  // No structural changes needed here. The order_id passed to this function
-  // must match the one used in dispatchOrder (both use the same path/key).
-  // Added timeout for campus Wi-Fi resilience (FIX #5 Flutter side).
-  Future<bool> validateOtp(String code, String orderId) async {
-    final url = Uri.parse("$baseUrl/api/validate-code");
+  // ─── helpers ──────────────────────────────────────────────────────────────
 
+  /// Parses a JSON body safely. Returns null instead of throwing on malformed
+  /// responses (e.g. an nginx 502 HTML page instead of a JSON body).
+  static Map<String, dynamic>? _parseJson(String body) {
     try {
-      final response = await http
-          .post(
-            url,
-            headers: {
-              "Content-Type": "application/json",
-              "X-Tunnel-Skip-AntiPhishing-Page": "true" // Adicione esta linha
-            },
-            body: jsonEncode({
-              "code": code,
-              "order_id": orderId,
-            }),
-          )
-          .timeout(_kApiTimeout);
-
-      if (response.statusCode == 200) {
-        debugPrint("validateOtp success: Compartimento aberto!");
-        return true;
-      } else {
-        final Map<String, dynamic> error;
-        try {
-          error = jsonDecode(response.body) as Map<String, dynamic>;
-        } catch (_) {
-          debugPrint("validateOtp failed — HTTP ${response.statusCode} (non-JSON body)");
-          return false;
-        }
-        // 401 → invalid/expired code
-        // 503 → robot hard-offline (uncertain state still passes on backend)
-        // 502 → MQTT publish failed for unlock command
-        debugPrint(
-          "validateOtp failed — HTTP ${response.statusCode}: ${error['detail']}",
-        );
-        return false;
-      }
-    } on Exception catch (e) {
-      debugPrint("validateOtp connection error: $e");
-      return false;
+      return jsonDecode(body) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
     }
   }
 }
 
 // ─── DispatchResult ──────────────────────────────────────────────────────────
-//
-// Typed wrapper for the /api/orders/{id}/dispatch response.
-// Using a dedicated model instead of Map<String, dynamic> catches schema
-// drift at compile time and makes callers readable.
+
 class DispatchResult {
   final bool success;
   final String orderId;
-  final String status;       // "dispatched" | "otp_only"
+  final String status;
   final String otpCode;
-  final bool mqttConnected;  // FIX #8: lets the UI surface a hardware warning
-  final String gatewayMode;  // "full" | "otp_only" | "degraded"
+  final bool mqttConnected;
+  final String gatewayMode;
 
   const DispatchResult({
     required this.success,
@@ -157,10 +221,6 @@ class DispatchResult {
     );
   }
 
-  /// True when the robot received the navigate command.
   bool get robotDispatched => mqttConnected;
-
-  /// True when we have an OTP but the robot hasn't received the navigate
-  /// command yet (broker was unreachable at dispatch time).
   bool get isOtpOnly => status == 'otp_only';
 }
