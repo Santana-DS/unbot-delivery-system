@@ -20,21 +20,23 @@ unbot-gateway/
 ├── internal/
 │   ├── api/
 │   │   ├── server.go        # Servidor HTTP e registro de rotas
-│   │   └── validate.go      # Handler POST /api/validate-code (Tradução HTTP -> Service)
+│   │   ├── validate.go      # Handler para validação de OTP
+│   │   └── dispatch.go      # Handler POST /api/orders/{id}/dispatch
 │   ├── config/
 │   │   └── config.go        # Carregamento e validação de variáveis de ambiente (.env)
 │   ├── mqtt/
 │   │   └── client.go        # Wrapper do Paho, auto-reconexão e stubs de handlers
 │   └── services/
-│       ├── otp.go           # Regra de negócio de validação, uso único e interface do Publisher
-│       └── otp_test.go      # Testes de concorrência (Race) e isolamento da regra de negócio
+│       ├── otp.go           # Geração e validação de OTP (Thread-safe)
+│       ├── order.go         # Orquestração de pedidos (Navigate + OTP)
+│       ├── otp_test.go      # Testes de concorrência e isolamento
+│       └── order_test.go    # Testes de integridade do fluxo de despacho
 ├── scripts/
 │   └── setup_mosquitto.sh   # Script IaC — instalação automatizada do Broker Mosquitto
 ├── .env.example             # Template das variáveis de ambiente
 ├── go.mod                   # Gerenciador de pacotes Go
 └── Makefile                 # Automação de comandos locais
 ```
-
 ## 🚀 Guia Rápido (Local)
 
 ```bash
@@ -48,6 +50,15 @@ cp .env.example .env
 # 3. Rode o Gateway
 make run
 ```
+## 🌐 Contratos da API (Gateway AWS)
+
+O Backend opera com uma arquitetura agnóstica de interface, expondo rotas HTTP para o aplicativo e orquestrando comandos via MQTT para o hardware.
+
+* **`POST /api/orders/{id}/dispatch`**
+    * **Função:** Orquestra a entrega. Gera criptograficamente um OTP de 4 dígitos de uso único e publica o comando de navegação (`robot/commands/navigate`) via MQTT para o sistema ROS 2.
+    * **Fallback:** Caso o robô esteja em uma área sem cobertura (Broker inacessível), a API degrada graciosamente para `GatewayModeOTPOnly`, garantindo que o usuário ainda receba o código para retirada manual.
+* **`POST /api/validate-code`**
+    * **Função:** Valida o OTP recebido do Flutter. Utiliza `sync.Mutex` para prevenir condições de corrida (double-spending) e publica o comando de abertura (`robot/commands/unlock`) diretamente para o ESP32.
 
 ## 📡 Como Testar a Nuvem (Para a Equipe)
 Você não precisa subir o servidor Go para ver se a nuvem está viva. Utilize o programa **MQTT Explorer** com os dados abaixo:
@@ -62,8 +73,12 @@ Você pode simular o celular de um cliente liberando a trava disparando este com
 ```powershell
 Invoke-RestMethod -Uri http://localhost:8080/api/validate-code -Method POST -ContentType "application/json" -Body '{"code":"1234","order_id":"order_mock_001"}'
 ```
-Você verá a ordem de abertura aparecer instantaneamente no tópico `robot/commands/unlock` no MQTT Explorer.
+## 📊 Estado Atual (Kanban de Sprints)
 
-## 🎯 Próximos Tickets
-- `internal/api/dispatch.go`  — Handler para POST `/api/orders/{id}/dispatch`
-- `internal/mqtt/publisher.go`— Helpers tipados para publicação (navigate, status)
+| Sprint | Foco | Status |
+| :--- | :--- | :--- |
+| **V1.0** | App Base, Gateway Local, Multi-Pedido | ✅ Concluído |
+| **V2.0 - Sprint 1** | Migração Go, Nuvem MQTT, Validação e Dispatch HTTP | ✅ Concluído |
+| **V2.0 - Sprint 2** | Integração Flutter (QR/OTP), UI State e ESP32 Firmware | 🟡 Em Andamento |
+| **V3.0** | WebRTC Raspberry Pi, Joystick Mobile e Vídeo | ⏳ Na Fila |
+```
