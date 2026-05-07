@@ -1,4 +1,4 @@
-module github.com/unb-ft/unbot-gateway
+module unbot-gateway
 
 go 1.22
 

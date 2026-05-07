@@ -20,7 +20,7 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 
-	"github.com/unb-ft/unbot-gateway/internal/config"
+	"unbot-gateway/internal/config"
 )
 
 // ── Topic constants ───────────────────────────────────────────────────────────

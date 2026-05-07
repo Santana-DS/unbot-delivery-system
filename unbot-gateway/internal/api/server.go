@@ -1,11 +1,8 @@
 // internal/api/server.go
 //
-// HTTP server scaffold. Currently exposes only /health so the cloud VM's
-// load balancer and the Flutter splash screen can probe gateway liveness.
-//
-// Subsequent tickets wire OTP and dispatch routes here by registering
-// handlers on the shared *http.ServeMux. The server is intentionally
-// stdlib-only — no framework dependency until routing complexity justifies one.
+// HTTP server. Routes are registered in s.routes() which now accepts
+// *services.OTPService so handlers can be wired without global state.
+// All handler logic lives in dedicated files (validate.go, etc.).
 package api
 
 import (
@@ -14,9 +11,10 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"unbot-gateway/internal/services"
 )
 
-// Server owns the HTTP listener lifecycle.
 type Server struct {
 	addr   string
 	log    *slog.Logger
@@ -24,14 +22,15 @@ type Server struct {
 	server *http.Server
 }
 
-// NewServer constructs the server and registers all routes.
-func NewServer(addr string, log *slog.Logger) *Server {
+// NewServer constructs the server. Call Start() to begin listening.
+// otpSvc is injected here so route registration can close over it.
+func NewServer(addr string, log *slog.Logger, otpSvc *services.OTPService) *Server {
 	s := &Server{
 		addr: addr,
 		log:  log,
 		mux:  http.NewServeMux(),
 	}
-	s.routes()
+	s.routes(otpSvc)
 	s.server = &http.Server{
 		Addr:         addr,
 		Handler:      s.mux,
@@ -42,7 +41,6 @@ func NewServer(addr string, log *slog.Logger) *Server {
 	return s
 }
 
-// Start begins listening in a goroutine. Non-blocking.
 func (s *Server) Start() {
 	go func() {
 		s.log.Info("HTTP server listening", "addr", s.addr)
@@ -52,7 +50,6 @@ func (s *Server) Start() {
 	}()
 }
 
-// Shutdown gracefully drains connections. Called from main's shutdown hook.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.log.Info("shutting down HTTP server")
 	return s.server.Shutdown(ctx)
@@ -60,13 +57,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // ── Route registration ────────────────────────────────────────────────────────
 
-func (s *Server) routes() {
+func (s *Server) routes(otpSvc *services.OTPService) {
 	s.mux.HandleFunc("/health", s.handleHealth)
-	// TODO: s.mux.HandleFunc("/api/orders/{id}/dispatch", s.handleDispatch)
-	// TODO: s.mux.HandleFunc("/api/validate-code",        s.handleValidateOTP)
+	s.mux.HandleFunc("/api/validate-code", s.validateCodeHandler(otpSvc))
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
+// ── Health handler ────────────────────────────────────────────────────────────
 
 type healthResponse struct {
 	Status  string `json:"status"`
@@ -78,6 +74,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(healthResponse{
 		Status:  "ok",
-		Version: "2.0.0-boilerplate",
+		Version: "2.0.0",
 	})
 }
