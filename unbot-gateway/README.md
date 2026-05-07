@@ -12,18 +12,22 @@ Na versão 2.0, migramos o Broker Mosquitto e este Gateway para a **Nuvem AWS**.
 
 ## 📂 Estrutura de Diretórios
 
-```
+```text
 unbot-gateway/
 ├── cmd/
 │   └── gateway/
-│       └── main.go          # Ponto de entrada — apenas inicialização, sem regras de negócio
+│       └── main.go          # Ponto de entrada — fiação de injeção de dependências
 ├── internal/
+│   ├── api/
+│   │   ├── server.go        # Servidor HTTP e registro de rotas
+│   │   └── validate.go      # Handler POST /api/validate-code (Tradução HTTP -> Service)
 │   ├── config/
 │   │   └── config.go        # Carregamento e validação de variáveis de ambiente (.env)
 │   ├── mqtt/
-│   │   └── client.go        # Wrapper do Paho, constantes de tópicos e stubs de handlers
-│   └── api/
-│       └── server.go        # Servidor HTTP, rotas de /health e validação de OTP
+│   │   └── client.go        # Wrapper do Paho, auto-reconexão e stubs de handlers
+│   └── services/
+│       ├── otp.go           # Regra de negócio de validação, uso único e interface do Publisher
+│       └── otp_test.go      # Testes de concorrência (Race) e isolamento da regra de negócio
 ├── scripts/
 │   └── setup_mosquitto.sh   # Script IaC — instalação automatizada do Broker Mosquitto
 ├── .env.example             # Template das variáveis de ambiente
@@ -46,30 +50,20 @@ make run
 ```
 
 ## 📡 Como Testar a Nuvem (Para a Equipe)
-Você não precisa subir o servidor Go para ver se a nuvem está viva. Utilize o programa **MQTT Explorer** com os dados abaixo (O app salva esses dados após o primeiro acesso):
+Você não precisa subir o servidor Go para ver se a nuvem está viva. Utilize o programa **MQTT Explorer** com os dados abaixo:
 
-*   **Host:** `3.22.171.3`
-*   **Port:** `1883`
-*   **Username:** `gateway`
-*   **Password:** *(Solicite ao Tech Lead)*
+* **Host:** `3.22.171.3`
+* **Port:** `1883`
+* **Username:** `gateway`
+* **Password:** *(Solicite ao Tech Lead)*
 
-Com o Gateway Go rodando localmente, você pode publicar um pulso de vida simulado a partir de qualquer terminal com `mosquitto-clients`:
+Você pode simular o celular de um cliente liberando a trava disparando este comando no PowerShell (Com o gateway rodando localmente):
 
-```bash
-mosquitto_pub \
-  -h 3.22.171.3 -p 1883 \
-  -u gateway -P <gateway-password> \
-  -t robot/status/heartbeat \
-  -m '{"source":"mock","status":"online"}'
+```powershell
+Invoke-RestMethod -Uri http://localhost:8080/api/validate-code -Method POST -ContentType "application/json" -Body '{"code":"1234","order_id":"order_mock_001"}'
 ```
-
-O terminal do seu Gateway local deverá imprimir:
-```json
-{"level":"INFO","msg":"heartbeat received","topic":"robot/status/heartbeat","payload":"{...}"}
-```
+Você verá a ordem de abertura aparecer instantaneamente no tópico `robot/commands/unlock` no MQTT Explorer.
 
 ## 🎯 Próximos Tickets
-- `internal/services/otp.go`  — Lógica de geração e validação de OTP
 - `internal/api/dispatch.go`  — Handler para POST `/api/orders/{id}/dispatch`
-- `internal/api/validate.go`  — Handler para POST `/api/validate-code`
-- `internal/mqtt/publisher.go`— Helpers tipados para publicação (navigate, unlock)
+- `internal/mqtt/publisher.go`— Helpers tipados para publicação (navigate, status)
