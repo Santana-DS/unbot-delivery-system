@@ -1,29 +1,28 @@
 // internal/services/otp.go
 //
-// OTP validation and unlock orchestration.
+// OTP validation, issuance, and unlock orchestration.
 //
-// DESIGN CONTRACT (enforced now, even though storage is mocked):
-//   - ValidateAndUnlock returns a typed error so callers distinguish
-//     "bad code" (401) from "broker down" (502) without string matching.
-//   - The Publisher interface is defined here so the services layer has
-//     zero import dependency on internal/mqtt. main.go wires the concrete
-//     implementation via dependency injection.
-//   - The mock store simulates single-use consumption: a code transitions
-//     from "valid" → "consumed" on first successful validation. Calling
-//     ValidateAndUnlock a second time with the same code returns ErrConsumed.
-//     This contract must survive intact when real storage is wired in.
+// DESIGN CONTRACT:
+//   - IssueOTP generates a cryptographically random 4-digit code, stores it
+//     atomically, and returns it. The caller (OrderService) echoes it to the
+//     Flutter app inside the DispatchResult payload.
+//   - ValidateAndUnlock is unchanged: single-use consumption, typed errors.
+//   - The Publisher interface is defined here to keep services/ free of any
+//     import dependency on internal/mqtt (no import cycle).
+//   - seedMockData is preserved for local testing; remove when real storage
+//     (Postgres/Redis) is introduced.
 package services
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 )
 
 // ── Errors ────────────────────────────────────────────────────────────────────
-// Typed sentinel errors let HTTP handlers map outcomes to status codes
-// without string matching or type assertions on generic errors.
 
 var (
 	ErrInvalidCode = fmt.Errorf("invalid or expired code")
@@ -32,25 +31,27 @@ var (
 )
 
 // ── Publisher interface ───────────────────────────────────────────────────────
-// Defined in services so this package has no import cycle with internal/mqtt.
-// mqtt.Client satisfies this interface structurally (duck typing) — no changes
-// to that package are required.
+// mqtt.Client satisfies this interface structurally — no changes to that
+// package are required. main.go wires the concrete type.
 
 type Publisher interface {
 	Publish(topic string, payload []byte) error
 }
 
-// ── MQTT topic ────────────────────────────────────────────────────────────────
+// ── MQTT topics ───────────────────────────────────────────────────────────────
 
-const TopicUnlock = "robot/commands/unlock"
+const (
+	TopicUnlock   = "robot/commands/unlock"
+	TopicNavigate = "robot/commands/navigate"
+)
 
 // ── OTPRecord ─────────────────────────────────────────────────────────────────
-// Represents a single issuable OTP. In production this lives in a database row.
 
 type OTPRecord struct {
 	Code     string
 	OrderID  string
 	Consumed bool
+	IssuedAt time.Time
 }
 
 // ── OTPService ────────────────────────────────────────────────────────────────
@@ -58,15 +59,10 @@ type OTPRecord struct {
 type OTPService struct {
 	publisher Publisher
 
-	// mu guards store. All access must go through the exported methods.
-	// When real storage (Postgres, Redis) replaces the map, remove mu entirely
-	// and let the DB driver handle its own concurrency — don't wrap it here.
 	mu    sync.Mutex
 	store map[string]*OTPRecord // key: code
 }
 
-// NewOTPService wires the publisher and seeds the mock store.
-// Replace the seed call with a real DB client in the production iteration.
 func NewOTPService(p Publisher) *OTPService {
 	svc := &OTPService{
 		publisher: p,
@@ -76,35 +72,71 @@ func NewOTPService(p Publisher) *OTPService {
 	return svc
 }
 
+// IssueOTP generates a cryptographically random 4-digit code, stores it in
+// the OTP table associated with orderID, and returns the plaintext code.
+//
+// The code is the ONLY secret — do not log it in production. The caller
+// (OrderService.Dispatch) is responsible for echoing it to the Flutter app
+// over HTTPS so the client can display it and later validate it.
+//
+// Collision probability for 4 digits (10^4 = 10 000 values) is negligible
+// for the expected concurrent order volume at a university campus. If you
+// scale beyond ~500 concurrent active orders, widen to 6 digits here and
+// in the Flutter OTP entry screen simultaneously.
+func (s *OTPService) IssueOTP(orderID string) (string, error) {
+	// crypto/rand for uniform distribution — math/rand.Intn is NOT suitable
+	// for security-sensitive token generation.
+	n, err := rand.Int(rand.Reader, big.NewInt(10_000))
+	if err != nil {
+		return "", fmt.Errorf("OTP generation failed: %w", err)
+	}
+
+	code := fmt.Sprintf("%04d", n.Int64())
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Overwrite any existing record for this orderID to handle re-dispatch
+	// (e.g., operator retries after a network failure). The old code is
+	// invalidated implicitly because lookup is by code, not orderID.
+	s.store[code] = &OTPRecord{
+		Code:     code,
+		OrderID:  orderID,
+		Consumed: false,
+		IssuedAt: time.Now().UTC(),
+	}
+
+	return code, nil
+}
+
 // seedMockData pre-populates the in-memory store with test codes.
 // Remove this method entirely when real storage is introduced.
 func (s *OTPService) seedMockData() {
 	testCodes := []OTPRecord{
-		{Code: "1234", OrderID: "order_mock_001"},
-		{Code: "5678", OrderID: "order_mock_002"},
-		{Code: "0000", OrderID: "order_mock_003"},
+		{Code: "1234", OrderID: "order_mock_001", IssuedAt: time.Now().UTC()},
+		{Code: "5678", OrderID: "order_mock_002", IssuedAt: time.Now().UTC()},
+		{Code: "0000", OrderID: "order_mock_003", IssuedAt: time.Now().UTC()},
 	}
 	for i := range testCodes {
 		s.store[testCodes[i].Code] = &testCodes[i]
 	}
 }
 
-// unlockPayload is the JSON structure published to the MQTT unlock topic.
-// issued_at lets the robot apply its own expiry guard against stale messages
-// that sat in the broker queue during a connectivity gap.
+// unlockPayload is the JSON published to robot/commands/unlock.
+// issued_at lets the ESP32 apply its own expiry guard against stale messages
+// that queued in the broker during a connectivity gap.
 type unlockPayload struct {
 	OrderID  string `json:"order_id"`
 	Code     string `json:"code"`
 	IssuedAt string `json:"issued_at"` // RFC3339 UTC
 }
 
-// ValidateAndUnlock validates the given code against the store and, on success,
-// publishes an unlock command to the robot via MQTT.
+// ValidateAndUnlock validates the given code and publishes the unlock command.
 //
-// Error semantics (callers must not match on error strings):
+// Error semantics:
 //   - ErrInvalidCode → HTTP 401
 //   - ErrConsumed    → HTTP 401 (same user-facing message, distinct log)
-//   - ErrPublish     → HTTP 502 (robot unreachable; do not tell user "opened")
+//   - ErrPublish     → HTTP 502 (MQTT unreachable; do NOT show "compartment opened")
 func (s *OTPService) ValidateAndUnlock(code, orderID string) error {
 	s.mu.Lock()
 	record, exists := s.store[code]
@@ -116,10 +148,9 @@ func (s *OTPService) ValidateAndUnlock(code, orderID string) error {
 		s.mu.Unlock()
 		return ErrConsumed
 	}
-	// Mark consumed before releasing the lock and before publishing.
-	// If the publish fails we return ErrPublish but the code remains consumed —
-	// this is intentional: the operator must reissue a new OTP rather than
-	// allow a replay of the same code after a transient broker failure.
+	// Mark consumed before releasing lock and before publishing.
+	// If publish fails, the code stays consumed — operator must reissue.
+	// This prevents replay attacks after transient broker failures.
 	record.Consumed = true
 	s.mu.Unlock()
 
@@ -129,8 +160,8 @@ func (s *OTPService) ValidateAndUnlock(code, orderID string) error {
 		IssuedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 	if err != nil {
-		// json.Marshal on a plain struct with string fields cannot fail in
-		// practice, but we handle it to satisfy the linter and for safety.
+		// json.Marshal on a plain struct cannot fail in practice, but handle
+		// for correctness and linter compliance.
 		return fmt.Errorf("%w: marshal: %v", ErrPublish, err)
 	}
 
