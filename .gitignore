@@ -27,6 +27,7 @@ venv/
 .pio/
 .pioenvs/
 libdeps/
+include/secrets.h
 
 # ─── IDE & SYSTEM ────────────────────────────────────────────────────────────
 .vscode/

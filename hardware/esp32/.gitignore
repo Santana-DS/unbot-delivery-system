@@ -1,0 +1,21 @@
+# =============================================================================
+# .gitignore — UnBot ESP32 Firmware
+# =============================================================================
+
+# CRITICAL: Never commit real credentials.
+# secrets.h.example is committed; secrets.h is not.
+include/secrets.h
+
+# PlatformIO build artefacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code PlatformIO extension state
+.vscode/.browse.vc.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch/
+
+# macOS
+.DS_Store
