@@ -53,7 +53,7 @@ static constexpr uint8_t  GPIO_ACTUATOR_PIN      = 2;
 
 // How long the actuator stays energised after a valid unlock command.
 // 5000 ms = 5 seconds. Adjust for your solenoid's hold time.
-static constexpr uint32_t ACTUATOR_HOLD_MS        = 5'000;
+static constexpr uint32_t ACTUATOR_HOLD_MS        = 5000;
 
 // =============================================================================
 // MQTT topic constants
@@ -65,7 +65,7 @@ static constexpr char TOPIC_HEARTBEAT[]  = "robot/status/heartbeat";
 // =============================================================================
 // Heartbeat configuration
 // =============================================================================
-static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30'000;  // 30 seconds
+static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30000;  // 30 seconds
 
 // =============================================================================
 // Payload staleness guard
@@ -74,7 +74,7 @@ static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30'000;  // 30 seconds
 // a connectivity gap and arrived late. The Go gateway sets issued_at to
 // time.Now().UTC().Format(time.RFC3339) — we parse the epoch seconds.
 // =============================================================================
-static constexpr uint32_t MAX_PAYLOAD_AGE_MS = 5UL * 60UL * 1'000UL;  // 5 minutes
+static constexpr uint32_t MAX_PAYLOAD_AGE_MS = 5UL * 60UL * 1000UL;  // 5 minutes
 
 // =============================================================================
 // Actuator state — shared between onUnlockCommand() and handleGpio()
