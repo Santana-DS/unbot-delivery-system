@@ -59,7 +59,7 @@ const (
 type NavigatePayload struct {
 	OrderID     string      `json:"order_id"`
 	Destination Destination `json:"destination"`
-	IssuedAt    string      `json:"issued_at"` // RFC3339 UTC
+	IssuedAt    int64       `json:"issued_at"` // Alterado para Unix Timestamp em segundos
 }
 
 type Destination struct {
@@ -144,7 +144,7 @@ func (s *OrderService) Dispatch(orderID string, dest Destination) (*DispatchResu
 			X: dest.X,
 			Y: dest.Y,
 		},
-		IssuedAt: time.Now().UTC().Format(time.RFC3339),
+		IssuedAt: time.Now().Unix(), // Padronizado com o unlock
 	})
 	if marshalErr != nil {
 		// json.Marshal on a plain struct with float64 fields cannot fail
