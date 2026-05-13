@@ -219,29 +219,27 @@ void onUnlockCommand(char* topic, uint8_t* payload, unsigned int length) {
                   topic, length);
 
     // ── Step 1: JSON parse ───────────────────────────────────────────────────
-    // Use a stack-allocated JsonDocument (ArduinoJson v7 style).
-    // 256 bytes is sufficient for our payload; adjust if fields are added.
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload, length);
 
     if (err) {
-        Serial.printf("[UNLOCK] JSON parse error: %s — payload dropped\n",
-                      err.c_str());
+        Serial.printf("[UNLOCK] JSON parse error: %s — payload dropped\n", err.c_str());
         return;
     }
 
     // ── Step 2: Field presence ───────────────────────────────────────────────
-    const char* orderId   = doc["order_id"]  | nullptr;
-    const char* code      = doc["code"]      | nullptr;
-    const char* issuedAt  = doc["issued_at"] | nullptr;
+    // REMOVIDO o "| nullptr" que estava quebrando o compilador C++
+    const char* orderId = doc["order_id"];
+    const char* code    = doc["code"];
+    long issuedAt       = doc["issued_at"]; // Se não existir, ele converte para 0
 
-    if (!orderId || !code || !issuedAt) {
+    // Se a chave não existir no JSON, o ArduinoJson já garante que será null ou 0
+    if (!orderId || !code || issuedAt == 0) {
         Serial.println(F("[UNLOCK] Missing required fields (order_id / code / issued_at) — dropped"));
         return;
     }
 
     // ── Step 3: Code format validation ──────────────────────────────────────
-    // Must be exactly 4 ASCII digit characters.
     if (strlen(code) != 4) {
         Serial.printf("[UNLOCK] Invalid code length (%d) — dropped\n", strlen(code));
         return;
@@ -254,22 +252,15 @@ void onUnlockCommand(char* topic, uint8_t* payload, unsigned int length) {
     }
 
     // ── Step 4: Staleness check ──────────────────────────────────────────────
-    // V2.0 simplified: only apply the staleness guard if the device has been
-    // running longer than MAX_PAYLOAD_AGE_MS (i.e., it is not in the early
-    // boot window where the clock is unreliable relative to wall time).
-    // Replace this block with NTP-based comparison in V3.0.
     if (millis() > MAX_PAYLOAD_AGE_MS) {
-        // If you add NTP (configTime), compare parsed epoch vs time(nullptr).
-        // For now, log the issued_at for operator inspection but do not block.
-        Serial.printf("[UNLOCK] issued_at: %s (staleness check: NTP not configured)\n",
-                      issuedAt);
+        Serial.printf("[UNLOCK] issued_at: %ld (staleness check: NTP not configured)\n", issuedAt);
     }
 
     // ── All checks passed: arm the actuator ─────────────────────────────────
     Serial.printf("[UNLOCK] ✓ Valid payload — arming actuator\n");
     Serial.printf("[UNLOCK]   order_id : %s\n", orderId);
     Serial.printf("[UNLOCK]   code     : %s\n", code);
-    Serial.printf("[UNLOCK]   issued_at: %s\n", issuedAt);
+    Serial.printf("[UNLOCK]   issued_at: %ld\n", issuedAt);
 
     // Store context for logging in handleGpio() when the hold ends.
     strncpy(actuator.orderId, orderId, sizeof(actuator.orderId) - 1);
@@ -277,9 +268,6 @@ void onUnlockCommand(char* topic, uint8_t* payload, unsigned int length) {
     actuator.orderId[sizeof(actuator.orderId) - 1] = '\0';
     actuator.code[sizeof(actuator.code)       - 1] = '\0';
 
-    // Arm the actuator. handleGpio() in the next loop() tick will see this
-    // and drive the GPIO HIGH. The two-step approach (arm here, actuate there)
-    // keeps the callback fast — no GPIO writes inside MQTT callbacks.
     actuator.armed     = true;
     actuator.armTimeMs = millis();
 }

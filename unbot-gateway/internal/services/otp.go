@@ -128,7 +128,7 @@ func (s *OTPService) seedMockData() {
 type unlockPayload struct {
 	OrderID  string `json:"order_id"`
 	Code     string `json:"code"`
-	IssuedAt string `json:"issued_at"` // RFC3339 UTC
+	IssuedAt int64  `json:"issued_at"` // Alterado para int64 (Unix Timestamp)
 }
 
 // ValidateAndUnlock validates the given code and publishes the unlock command.
@@ -157,7 +157,7 @@ func (s *OTPService) ValidateAndUnlock(code, orderID string) error {
 	payload, err := json.Marshal(unlockPayload{
 		OrderID:  orderID,
 		Code:     code,
-		IssuedAt: time.Now().UTC().Format(time.RFC3339),
+		IssuedAt: time.Now().Unix(), // Alterado para enviar segundos em inteiro
 	})
 	if err != nil {
 		// json.Marshal on a plain struct cannot fail in practice, but handle
