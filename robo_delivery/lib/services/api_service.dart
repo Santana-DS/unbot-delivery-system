@@ -2,32 +2,24 @@
 //
 // CHANGES IN THIS REVISION
 // ────────────────────────
-// Phase 1 — Typed unlock result:
-//   • Replaced the previous `Future<bool> validateOtp(...)` with
-//     `Future<UnlockResult> validateOtp(...)`.
-//   • Introduced the sealed class hierarchy `UnlockResult` with four
-//     exhaustive subtypes: UnlockSuccess, UnlockInvalidCode,
-//     UnlockRobotUnreachable, UnlockNetworkError.
-//   • The UI layer switches on UnlockResult and never sees a status code
-//     or a raw exception. All HTTP/network surface area is quarantined here.
-//   • dispatchOrder() is unchanged — it already used a typed result model.
+// Environment management:
+//   • baseUrl is now sourced from AppConfig.apiBaseUrl (a compile-time
+//     --dart-define constant) instead of a hardcoded string literal.
+//   • _kApiTimeout is now sourced from AppConfig.apiTimeout.
+//   • No other logic changes — ApiService remains a pure HTTP client.
 //
-// SEALED CLASS RATIONALE (Dart 3)
-// ────────────────────────────────
-// `sealed` forces every switch on UnlockResult to be exhaustive at compile
-// time. If a future engineer adds a fifth subtype (e.g. UnlockRateLimited)
-// the compiler will flag every unhandled switch site immediately — no silent
-// fall-through to a wrong UI state at runtime.
+// To run against the local Go server on an Android emulator:
+//   flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8080
+//
+// See lib/config/app_config.dart for the full environment switching guide.
+
 // ignore_for_file: prefer_const_constructors
 
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-
-// ─── CONSTANTS ────────────────────────────────────────────────────────────────
-
-const Duration _kApiTimeout = Duration(seconds: 10);
+import '../config/app_config.dart';
 
 // ─── SEALED RESULT HIERARCHY ─────────────────────────────────────────────────
 //
@@ -77,19 +69,18 @@ final class UnlockNetworkError extends UnlockResult {
 // ─── API SERVICE ─────────────────────────────────────────────────────────────
 
 class ApiService {
-  // Swap for your production gateway URL via a build-time const or --dart-define.
-  static const String baseUrl = 'https://rvdj88q6-8000.brs.devtunnels.ms';
+  // CHANGED: baseUrl and timeout now read from AppConfig (compile-time
+  // --dart-define constants) instead of hardcoded strings.
+  //
+  // Default resolves to the production AWS tunnel URL when no
+  // --dart-define=API_BASE_URL flag is provided at build time.
+  static String get baseUrl => AppConfig.apiBaseUrl;
 
   // ─── validateOtp ───────────────────────────────────────────────────────────
   //
   // Sends POST /api/validate-code and maps every possible outcome to the
   // sealed UnlockResult hierarchy. No raw status codes or http.Response
   // objects are returned to the caller.
-  //
-  // Parameters:
-  //   code    — exactly 4 ASCII digit characters (validation is the caller's
-  //             responsibility; the gateway also validates server-side).
-  //   orderId — the active order identifier from ActiveOrder.orderId.
   Future<UnlockResult> validateOtp(String code, String orderId) async {
     final url = Uri.parse('$baseUrl/api/validate-code');
 
@@ -100,7 +91,7 @@ class ApiService {
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({'code': code, 'order_id': orderId}),
           )
-          .timeout(_kApiTimeout);
+          .timeout(AppConfig.apiTimeout);
 
       // ── Happy path ──────────────────────────────────────────────────────
       if (response.statusCode == 200) {
@@ -125,12 +116,10 @@ class ApiService {
         return UnlockRobotUnreachable(message: detail);
       }
 
-      // Any other 4xx/5xx — treat as network-layer error; do not assume
-      // the code was consumed since we don't know server state.
       return const UnlockNetworkError();
 
     } on TimeoutException {
-      debugPrint('validateOtp timed out after ${_kApiTimeout.inSeconds}s');
+      debugPrint('validateOtp timed out after ${AppConfig.apiTimeout.inSeconds}s');
       return const UnlockNetworkError(
           message: 'Tempo de resposta excedido. Tente novamente.');
     } on Exception catch (e) {
@@ -140,7 +129,6 @@ class ApiService {
   }
 
   // ─── dispatchOrder ─────────────────────────────────────────────────────────
-  // Unchanged from previous revision — already uses a typed result model.
   Future<DispatchResult?> dispatchOrder(
     String orderId,
     String restaurantName,
@@ -157,7 +145,7 @@ class ApiService {
               'restaurant_name': restaurantName,
             }),
           )
-          .timeout(_kApiTimeout);
+          .timeout(AppConfig.apiTimeout);
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -180,8 +168,7 @@ class ApiService {
 
   // ─── helpers ──────────────────────────────────────────────────────────────
 
-  /// Parses a JSON body safely. Returns null instead of throwing on malformed
-  /// responses (e.g. an nginx 502 HTML page instead of a JSON body).
+  /// Parses a JSON body safely. Returns null on malformed responses.
   static Map<String, dynamic>? _parseJson(String body) {
     try {
       return jsonDecode(body) as Map<String, dynamic>;

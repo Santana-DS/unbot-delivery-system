@@ -1,4 +1,18 @@
 // lib/screens/client/tracking_screen.dart
+//
+// CHANGES IN THIS REVISION
+// ────────────────────────
+// BUG FIX — Order history cancellation reason:
+//   The cancel dialog previously called removeOrder(order.orderId) with no
+//   `reason` argument, which defaulted to 'completed'. This caused cancelled
+//   orders to appear with an "Entregue" badge in the history sheet instead of
+//   "Cancelado". Fixed by passing reason: 'cancelled' explicitly.
+//
+//   Root cause: removeOrder()'s default parameter is 'completed' — correct for
+//   the happy path in code_screen.dart, but the cancel dialog is a different
+//   call site that must be explicit.
+//
+// All other logic and layout is unchanged from the previous revision.
 // ignore_for_file: prefer_const_constructors
 
 import 'dart:async';
@@ -9,11 +23,6 @@ import '../../state/active_order_state.dart';
 import '../../widgets/widgets.dart';
 import 'code_screen.dart';
 
-// OBJECTIVE 4: Full AC.*(context) audit.
-// Every AppColors.surface / AppColors.card / AppColors.primary / AppColors.muted
-// that was hardcoded in static contexts has been replaced with the dynamic
-// AC. accessors. The map overlay ETA bar (previously Colors.white) is now
-// AC.card(context). InstructionStep and StepTile backgrounds updated accordingly.
 class TrackingScreen extends StatefulWidget {
   final bool standalone;
   final ActiveOrder? order;
@@ -110,7 +119,7 @@ class _TrackingScreenState extends State<TrackingScreen>
                   : 'Acompanhar pedido',
             ),
             floating: true,
-            backgroundColor: AC.surface(context), // FIXED
+            backgroundColor: AC.surface(context),
             surfaceTintColor: Colors.transparent,
           ),
 
@@ -125,7 +134,6 @@ class _TrackingScreenState extends State<TrackingScreen>
             ),
           ),
 
-        // ── Map ──────────────────────────────────────────────────────────
         SliverToBoxAdapter(
           child: _TrackingMap(
             robotProgress: _robotProgress,
@@ -138,7 +146,6 @@ class _TrackingScreenState extends State<TrackingScreen>
           padding: const EdgeInsets.all(20),
           sliver: SliverList(
             delegate: SliverChildListDelegate([
-              // ── Order summary card ─────────────────────────────────────
               if (order != null)
                 AppCard(
                   borderColor: AppColors.accent,
@@ -172,13 +179,13 @@ class _TrackingScreenState extends State<TrackingScreen>
                               style: GoogleFonts.spaceGrotesk(
                                 fontSize: 13,
                                 fontWeight: FontWeight.w600,
-                                color: AC.primary(context), // FIXED
+                                color: AC.primary(context),
                               ),
                             ),
                             Text(
                               order.itemsSummary,
                               style: GoogleFonts.dmSans(
-                                  fontSize: 12, color: AC.muted(context)), // FIXED
+                                  fontSize: 12, color: AC.muted(context)),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                             ),
@@ -197,7 +204,6 @@ class _TrackingScreenState extends State<TrackingScreen>
                   ),
                 ),
 
-              // ── MQTT offline warning banner ────────────────────────────
               if (order != null && order.isOtpOnly) ...[
                 const SizedBox(height: 10),
                 Container(
@@ -229,12 +235,10 @@ class _TrackingScreenState extends State<TrackingScreen>
               const SizedBox(height: 20),
               const SectionLabel('Status da entrega'),
 
-              // ── Timeline steps ─────────────────────────────────────────
               ..._steps.map((s) => _StepTile(step: s)),
 
               const SizedBox(height: 20),
 
-              // ── "Ver código" button ────────────────────────────────────
               AppButton(
                 label: 'Ver código de retirada',
                 onTap: () {
@@ -260,7 +264,6 @@ class _TrackingScreenState extends State<TrackingScreen>
 
               const SizedBox(height: 12),
 
-              // ── "Cancelar pedido" button ───────────────────────────────
               if (order != null)
                 AppButton(
                   label: 'Cancelar pedido',
@@ -268,30 +271,37 @@ class _TrackingScreenState extends State<TrackingScreen>
                     showDialog(
                       context: context,
                       builder: (ctx) => AlertDialog(
-                        backgroundColor: AC.card(context), // FIXED
+                        backgroundColor: AC.card(context),
                         shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(16)),
                         title: Text('Cancelar pedido?',
                             style: GoogleFonts.spaceGrotesk(
                                 fontSize: 16,
                                 fontWeight: FontWeight.w700,
-                                color: AC.primary(context))), // FIXED
+                                color: AC.primary(context))),
                         content: Text(
                           'O pedido ${order.shortId} será removido da sua lista.',
                           style: GoogleFonts.dmSans(
-                              fontSize: 13, color: AC.muted(context)), // FIXED
+                              fontSize: 13, color: AC.muted(context)),
                         ),
                         actions: [
                           TextButton(
                             onPressed: () => Navigator.pop(ctx),
                             child: Text('Voltar',
                                 style: GoogleFonts.dmSans(
-                                    color: AC.muted(context))), // FIXED
+                                    color: AC.muted(context))),
                           ),
                           TextButton(
                             onPressed: () {
                               Navigator.pop(ctx);
-                              removeOrder(order.orderId);
+                              // FIX: was removeOrder(order.orderId) with no
+                              // reason argument, which defaulted to 'completed'.
+                              // Cancelled orders must be archived as 'cancelled'
+                              // so the history sheet shows the correct badge.
+                              removeOrder(
+                                order.orderId,
+                                reason: 'cancelled',
+                              );
                               if (widget.standalone && mounted) {
                                 Navigator.pop(context);
                               }
@@ -326,14 +336,14 @@ class _TrackingScreenState extends State<TrackingScreen>
 
     return widget.standalone
         ? Scaffold(
-            backgroundColor: AC.surface(context), // FIXED: was AppColors.surface
+            backgroundColor: AC.surface(context),
             body: content)
         : content;
   }
 }
 
 // ─── MAP WIDGET ──────────────────────────────────────────────────────────────
-// OBJECTIVE 4: ETA bar background was Colors.white — now AC.card(context)
+
 class _TrackingMap extends StatelessWidget {
   final double robotProgress;
   final int etaMinutes;
@@ -350,54 +360,41 @@ class _TrackingMap extends StatelessWidget {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return Container(
       height: 220,
-      color: AC.mapBg(context), // FIXED: was AppColors.mapBg
+      color: AC.mapBg(context),
       child: Stack(
         children: [
           Positioned.fill(
-            child: CustomPaint(painter: MapBackgroundPainter(isDark: isDark)), // FIXED: passes isDark
+            child: CustomPaint(painter: MapBackgroundPainter(isDark: isDark)),
           ),
           Positioned.fill(
             child: CustomPaint(
               painter: _TrackingRoutePainter(progress: robotProgress),
             ),
           ),
-          // Restaurant pin
           Positioned(
-            left: 24,
-            top: 60,
+            left: 24, top: 60,
             child: Container(
-              width: 36,
-              height: 36,
+              width: 36, height: 36,
               decoration: BoxDecoration(
-                color: AppColors.purple,
-                borderRadius: BorderRadius.circular(10),
-              ),
+                  color: AppColors.purple,
+                  borderRadius: BorderRadius.circular(10)),
               child: const Center(
-                child: Text('🍱', style: TextStyle(fontSize: 18)),
-              ),
+                  child: Text('🍱', style: TextStyle(fontSize: 18))),
             ),
           ),
-          // Destination pin
           Positioned(
-            right: 30,
-            top: 130,
-            child: Column(
-              children: [
-                Container(
-                  width: 30,
-                  height: 30,
-                  decoration: const BoxDecoration(
-                    color: AppColors.teal,
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(Icons.home_rounded,
-                      color: Colors.white, size: 16),
-                ),
-                Container(width: 2, height: 8, color: AppColors.teal),
-              ],
-            ),
+            right: 30, top: 130,
+            child: Column(children: [
+              Container(
+                width: 30, height: 30,
+                decoration: const BoxDecoration(
+                    color: AppColors.teal, shape: BoxShape.circle),
+                child: const Icon(Icons.home_rounded,
+                    color: Colors.white, size: 16),
+              ),
+              Container(width: 2, height: 8, color: AppColors.teal),
+            ]),
           ),
-          // Robot
           AnimatedBuilder(
             animation: pulseCtrl,
             builder: (ctx, child) {
@@ -405,79 +402,59 @@ class _TrackingMap extends StatelessWidget {
                 left: MediaQuery.of(context).size.width * robotProgress - 60,
                 top: 60,
                 child: Transform.scale(
-                  scale: 1.0 + pulseCtrl.value * 0.1,
-                  child: child,
-                ),
+                    scale: 1.0 + pulseCtrl.value * 0.1, child: child),
               );
             },
             child: Container(
-              width: 44,
-              height: 44,
+              width: 44, height: 44,
               decoration: BoxDecoration(
                 color: AppColors.accent,
                 shape: BoxShape.circle,
                 boxShadow: [
                   BoxShadow(
-                    color: AppColors.accent.withValues(alpha: 0.4),
-                    blurRadius: 14,
-                    spreadRadius: 5,
-                  ),
+                      color: AppColors.accent.withValues(alpha: 0.4),
+                      blurRadius: 14, spreadRadius: 5),
                 ],
               ),
               child: const RobotIcon(size: 28, color: Colors.white),
             ),
           ),
-          // ETA bar — FIXED: was Colors.white.withValues(alpha:0.95)
           Positioned(
-            bottom: 10,
-            left: 12,
-            right: 12,
+            bottom: 10, left: 12, right: 12,
             child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               decoration: BoxDecoration(
-                color: AC.card(context).withValues(alpha: 0.95), // FIXED
+                color: AC.card(context).withValues(alpha: 0.95),
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Row(
                 children: [
                   Container(
-                    width: 8,
-                    height: 8,
-                    decoration: const BoxDecoration(
-                      color: AppColors.teal,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
+                      width: 8, height: 8,
+                      decoration: const BoxDecoration(
+                          color: AppColors.teal, shape: BoxShape.circle)),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        Text('Robô em rota',
+                            style: GoogleFonts.dmSans(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w500,
+                                color: AC.primary(context))),
                         Text(
-                          'Robô em rota',
-                          style: GoogleFonts.dmSans(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                            color: AC.primary(context), // FIXED
-                          ),
-                        ),
-                        Text(
-                          '${((1 - robotProgress) * 500).toInt()} metros do destino',
-                          style: GoogleFonts.dmSans(
-                              fontSize: 11, color: AC.muted(context)), // FIXED
-                        ),
+                            '${((1 - robotProgress) * 500).toInt()} metros do destino',
+                            style: GoogleFonts.dmSans(
+                                fontSize: 11, color: AC.muted(context))),
                       ],
                     ),
                   ),
-                  Text(
-                    '$etaMinutes min',
-                    style: GoogleFonts.spaceGrotesk(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w700,
-                      color: AppColors.accent,
-                    ),
-                  ),
+                  Text('$etaMinutes min',
+                      style: GoogleFonts.spaceGrotesk(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.accent)),
                 ],
               ),
             ),
@@ -488,10 +465,8 @@ class _TrackingMap extends StatelessWidget {
   }
 }
 
-// ─── Route painter ───────────────────────────────────────────────────────────
 class _TrackingRoutePainter extends CustomPainter {
   final double progress;
-
   _TrackingRoutePainter({required this.progress});
 
   @override
@@ -514,9 +489,7 @@ class _TrackingRoutePainter extends CustomPainter {
     double distance = 0;
     while (distance < pathMetric.length) {
       canvas.drawPath(
-        pathMetric.extractPath(distance, distance + dashWidth),
-        paint,
-      );
+          pathMetric.extractPath(distance, distance + dashWidth), paint);
       distance += dashWidth + dashSpace;
     }
   }
@@ -526,7 +499,6 @@ class _TrackingRoutePainter extends CustomPainter {
       old.progress != progress;
 }
 
-// ─── Status step model ────────────────────────────────────────────────────────
 class _StatusStep {
   final IconData icon;
   final String label;
@@ -543,11 +515,8 @@ class _StatusStep {
   });
 }
 
-// ─── Step tile ────────────────────────────────────────────────────────────────
-// OBJECTIVE 4: was AppColors.card / AppColors.primary.withValues / AppColors.muted
 class _StepTile extends StatelessWidget {
   final _StatusStep step;
-
   const _StepTile({required this.step});
 
   @override
@@ -557,56 +526,48 @@ class _StepTile extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         decoration: BoxDecoration(
-          color: AC.card(context), // FIXED
+          color: AC.card(context),
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
             color: step.active
                 ? AppColors.accent.withValues(alpha: 0.3)
-                : AC.border(context), // FIXED
+                : AC.border(context),
           ),
         ),
         child: Row(
           children: [
             Container(
-              width: 34,
-              height: 34,
+              width: 34, height: 34,
               decoration: BoxDecoration(
                 color: step.done
                     ? AppColors.teal.withValues(alpha: 0.15)
                     : step.active
                         ? AppColors.accent.withValues(alpha: 0.12)
-                        : AC.primary(context).withValues(alpha: 0.06), // FIXED
+                        : AC.primary(context).withValues(alpha: 0.06),
                 shape: BoxShape.circle,
               ),
-              child: Icon(
-                step.icon,
-                size: 17,
-                color: step.done
-                    ? AppColors.teal
-                    : step.active
-                        ? AppColors.accent
-                        : AC.muted(context), // FIXED
-              ),
+              child: Icon(step.icon, size: 17,
+                  color: step.done
+                      ? AppColors.teal
+                      : step.active
+                          ? AppColors.accent
+                          : AC.muted(context)),
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: Text(
-                step.label,
+              child: Text(step.label,
+                  style: GoogleFonts.dmSans(
+                      fontSize: 13,
+                      fontWeight: step.active
+                          ? FontWeight.w500
+                          : FontWeight.w400,
+                      color: step.done || step.active
+                          ? AC.primary(context)
+                          : AC.muted(context))),
+            ),
+            Text(step.time,
                 style: GoogleFonts.dmSans(
-                  fontSize: 13,
-                  fontWeight:
-                      step.active ? FontWeight.w500 : FontWeight.w400,
-                  color: step.done || step.active
-                      ? AC.primary(context) // FIXED
-                      : AC.muted(context), // FIXED
-                ),
-              ),
-            ),
-            Text(
-              step.time,
-              style: GoogleFonts.dmSans(
-                  fontSize: 11, color: AC.muted(context)), // FIXED
-            ),
+                    fontSize: 11, color: AC.muted(context))),
           ],
         ),
       ),

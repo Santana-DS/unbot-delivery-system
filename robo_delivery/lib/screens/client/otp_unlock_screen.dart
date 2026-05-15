@@ -1,48 +1,40 @@
 // lib/screens/client/otp_unlock_screen.dart
 //
-// Phase 2 — OTP Entry Screen with explicit state machine.
+// CHANGES IN THIS REVISION (Phase 3 — QR Scanner)
+// ─────────────────────────────────────────────────────────────────────────────
+// REPLACED: _QrScannerStubDialog (text input simulation)
+// WITH:     QrScannerScreen — a full-screen camera overlay using mobile_scanner.
 //
-// STATE MACHINE
-// ─────────────
-//   OtpScreenState is a sealed class with four subtypes:
+// INTEGRATION POINTS (unchanged from Phase 2):
+//   • _prefill(String code) receives the scanned 4-digit string and populates
+//     the digit fields exactly as before.
+//   • Auto-submit fires 300 ms after prefill so the user sees the digits flash
+//     in before the request fires — UX intentional.
+//   • The _OtpController state machine, focus node management, and all error
+//     handling paths are completely unchanged.
 //
-//     OtpIdle         Initial state. Submit enabled when all 4 digits filled.
-//     OtpValidating   API call in-flight. Submit locked, spinner shown.
-//     OtpSuccess      Gateway confirmed unlock. Transition to success UI.
-//     OtpError        Terminal per-attempt error with typed message + action hint.
+// PACKAGE REQUIREMENT (add to pubspec.yaml):
+//   mobile_scanner: ^5.0.0
 //
-//   Transitions live exclusively in _OtpController (a ChangeNotifier).
-//   The widget tree calls exactly one method: controller.submit(). Everything
-//   else — focus management, auto-advance, backspace retreat — is local widget
-//   logic that does not need to survive a rebuild.
+// ANDROID: Add to android/app/src/main/AndroidManifest.xml inside <manifest>:
+//   <uses-permission android:name="android.permission.CAMERA" />
 //
-// FOCUS NODE DESIGN
-// ─────────────────
-//   Four FocusNodes are created in initState() and disposed in dispose().
-//   Each _OtpDigitField calls onChanged which:
-//     1. Stores the digit in the controller's _digits list.
-//     2. If a digit was entered (length == 1) → requests focus on [i+1].
-//     3. If backspace cleared the field (length == 0) → requests focus on [i-1].
-//   There is no RawKeyboardListener or KeyEventResult involved — we use the
-//   TextEditingController's onChanged callback plus a custom InputFormatter
-//   that allows only a single digit. This keeps the implementation compatible
-//   with both physical keyboards and software keyboards without any platform
-//   channel hackery.
+// IOS: Add to ios/Runner/Info.plist:
+//   <key>NSCameraUsageDescription</key>
+//   <string>Usado para escanear o QR Code do robô UnBot.</string>
 //
-// STATE MANAGEMENT CHOICE: StatefulWidget + ChangeNotifier
-// ──────────────────────────────────────────────────────────
-//   The project already uses provider for global state (active_order_state,
-//   user_state). For screen-local state a ChangeNotifier owned by the State
-//   object is the correct granularity — no Provider ancestor needed, no
-//   BuildContext.watch() outside the widget that owns the controller, and
-//   the controller is guaranteed to be disposed with the screen.
-//   Riverpod or Bloc would be over-engineering for a single-screen flow.
+// WHY mobile_scanner OVER qr_code_scanner:
+//   • qr_code_scanner is unmaintained (last pub.dev release 2022, open CVEs).
+//   • mobile_scanner is the community successor, null-safe, supports Android
+//     and iOS with the same API, and uses the platform's native ML Kit / AVFoundation
+//     scanner — no third-party C++ dependency to compile.
 // ignore_for_file: prefer_const_constructors
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/widgets.dart';
 import '../../services/api_service.dart';
@@ -66,19 +58,13 @@ final class OtpSuccess extends OtpScreenState {
   const OtpSuccess({required this.orderId});
 }
 
-/// Terminal per-attempt error. [isRetryable] drives whether to show a retry
-/// button (transient errors) or a re-entry prompt (permanent errors).
 final class OtpError extends OtpScreenState {
   final String message;
-
-  /// true  → 502 / network error  → show retry SnackBar, keep digits intact.
-  /// false → 401 invalid code     → show inline error, clear digits.
   final bool isRetryable;
-
   const OtpError({required this.message, required this.isRetryable});
 }
 
-// ─── CONTROLLER (ChangeNotifier) ─────────────────────────────────────────────
+// ─── CONTROLLER ──────────────────────────────────────────────────────────────
 
 class _OtpController extends ChangeNotifier {
   _OtpController({required this.orderId});
@@ -89,32 +75,20 @@ class _OtpController extends ChangeNotifier {
   OtpScreenState _state = const OtpIdle();
   OtpScreenState get state => _state;
 
-  // Raw digit storage — index 0..3 maps to field 0..3.
-  // Exposed as a getter so the widget can read the current assembled code
-  // without the controller caring about TextEditingControllers.
   final List<String> _digits = ['', '', '', ''];
 
   void setDigit(int index, String value) {
     assert(index >= 0 && index < 4);
     _digits[index] = value;
-    // No notifyListeners() here — the digit change only affects focus
-    // and the submit-button enabled state, both of which are derived
-    // directly from _isComplete. We notify only on state transitions.
     notifyListeners();
   }
 
   bool get _isComplete => _digits.every((d) => d.isNotEmpty);
-
-  /// The 4-digit code assembled from the current digit list.
   String get code => _digits.join();
-
-  /// Whether the submit button should be interactive.
-  bool get canSubmit =>
-      _isComplete && _state is OtpIdle;
+  bool get canSubmit => _isComplete && _state is OtpIdle;
 
   Future<void> submit() async {
     if (!canSubmit) return;
-
     _transition(const OtpValidating());
 
     final result = await _api.validateOtp(code, orderId);
@@ -122,16 +96,11 @@ class _OtpController extends ChangeNotifier {
     switch (result) {
       case UnlockSuccess(:final orderId):
         _transition(OtpSuccess(orderId: orderId));
-
       case UnlockInvalidCode(:final message):
-        // Clear digits so the user must re-enter a new code.
         _digits.fillRange(0, 4, '');
         _transition(OtpError(message: message, isRetryable: false));
-
       case UnlockRobotUnreachable(:final message):
-        // Keep digits intact — user can retry the same code.
         _transition(OtpError(message: message, isRetryable: true));
-
       case UnlockNetworkError(:final message):
         _transition(OtpError(message: message, isRetryable: true));
     }
@@ -151,10 +120,7 @@ class _OtpController extends ChangeNotifier {
 // ─── SCREEN ──────────────────────────────────────────────────────────────────
 
 class OtpUnlockScreen extends StatefulWidget {
-  /// The active order's backend identifier. Passed to the gateway as order_id.
   final String orderId;
-
-  /// Optional: pre-fill the OTP fields when arriving from QR scanner.
   final String? prefillCode;
 
   const OtpUnlockScreen({
@@ -169,10 +135,6 @@ class OtpUnlockScreen extends StatefulWidget {
 
 class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
   late final _OtpController _controller;
-
-  // Four controllers + four focus nodes, one per digit field.
-  // Created once in initState(), disposed in dispose().
-  // The ordering contract: index 0 = leftmost digit.
   late final List<TextEditingController> _textCtrls;
   late final List<FocusNode> _focusNodes;
 
@@ -183,7 +145,6 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
     _textCtrls = List.generate(4, (_) => TextEditingController());
     _focusNodes = List.generate(4, (_) => FocusNode());
 
-    // Pre-fill from QR scanner if a code was supplied.
     if (widget.prefillCode != null && widget.prefillCode!.length == 4) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _prefill(widget.prefillCode!);
@@ -203,42 +164,37 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
     super.dispose();
   }
 
-  // ── Pre-fill from QR ───────────────────────────────────────────────────────
+  // ── Pre-fill from QR or prefillCode prop ──────────────────────────────────
+  //
+  // This method is the single integration point for QR scanning.
+  // Both the prefillCode constructor prop (deep-link / navigate-with-code
+  // use case) and the camera scanner call this method.
   void _prefill(String code) {
     for (var i = 0; i < 4; i++) {
       _textCtrls[i].text = code[i];
       _controller.setDigit(i, code[i]);
     }
-    // Move focus past last field after pre-fill.
     _focusNodes.last.unfocus();
-    // Auto-submit after a short delay so the user sees the digits flash in.
+    // 300 ms delay so the user sees the digits populate before the spinner
+    // fires — intentional UX, not a race condition workaround.
     Future.delayed(const Duration(milliseconds: 300), () {
       if (mounted) _handleSubmit();
     });
   }
 
-  // ── Digit field callbacks ─────────────────────────────────────────────────
-
   void _onDigitChanged(int index, String value) {
     if (value.length == 1) {
-      // Digit entered — store and advance focus.
       _controller.setDigit(index, value);
       if (index < 3) {
         _focusNodes[index + 1].requestFocus();
       } else {
-        // Last field filled — dismiss keyboard.
         _focusNodes[index].unfocus();
       }
     } else if (value.isEmpty) {
-      // Field cleared (backspace) — store empty and retreat focus.
       _controller.setDigit(index, '');
-      if (index > 0) {
-        _focusNodes[index - 1].requestFocus();
-      }
+      if (index > 0) _focusNodes[index - 1].requestFocus();
     }
   }
-
-  // ── Submit ─────────────────────────────────────────────────────────────────
 
   Future<void> _handleSubmit() async {
     FocusScope.of(context).unfocus();
@@ -247,20 +203,15 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
     if (!mounted) return;
 
     final state = _controller.state;
-
     if (state is OtpError) {
       if (state.isRetryable) {
-        // 502 / network: SnackBar with retry action, keep digits.
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(
-              state.message,
-              style: GoogleFonts.dmSans(fontSize: 13, color: Colors.white),
-            ),
+            content: Text(state.message,
+                style: GoogleFonts.dmSans(fontSize: 13, color: Colors.white)),
             backgroundColor: const Color(0xFFB97A00),
             behavior: SnackBarBehavior.floating,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             margin: const EdgeInsets.all(16),
             duration: const Duration(seconds: 5),
             action: SnackBarAction(
@@ -270,21 +221,31 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
             ),
           ),
         );
-        // Reset to idle so the button re-enables — digits are still populated.
         _controller._transition(const OtpIdle());
       } else {
-        // 401: clear the digit fields and return focus to the first field.
         for (final c in _textCtrls) {
           c.clear();
         }
         _focusNodes[0].requestFocus();
-        // State was already set to OtpError(isRetryable: false) by the
-        // controller, which means the inline error widget will render.
       }
     }
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
+  // ── QR Scanner ────────────────────────────────────────────────────────────
+  //
+  // CHANGED: Replaced _QrScannerStubDialog with a push to QrScannerScreen.
+  // The result is a nullable String — null means the user cancelled.
+  // A non-null result is always a validated 4-digit string (QrScannerScreen
+  // only pops with a value after passing its own digit validation).
+  Future<void> _openQrScanner() async {
+    final scanned = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => const QrScannerScreen()),
+    );
+    if (scanned != null && mounted) {
+      _prefill(scanned);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -310,11 +271,9 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                // ── Hero icon ───────────────────────────────────────────
                 _LockIcon(unlocked: false),
                 const SizedBox(height: 28),
 
-                // ── Heading ─────────────────────────────────────────────
                 Text(
                   'Digite o código de 4 dígitos',
                   style: GoogleFonts.spaceGrotesk(
@@ -328,16 +287,12 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
                 Text(
                   'Insira o código recebido após confirmar seu pedido,\nou escaneie o QR Code do robô.',
                   style: GoogleFonts.dmSans(
-                    fontSize: 13,
-                    color: AC.muted(context),
-                    height: 1.5,
-                  ),
+                      fontSize: 13, color: AC.muted(context), height: 1.5),
                   textAlign: TextAlign.center,
                 ),
 
                 const SizedBox(height: 36),
 
-                // ── OTP fields ──────────────────────────────────────────
                 _OtpFieldRow(
                   textCtrls: _textCtrls,
                   focusNodes: _focusNodes,
@@ -346,7 +301,6 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
                   enabled: state is! OtpValidating,
                 ),
 
-                // ── Inline error (401 only) ──────────────────────────────
                 AnimatedSwitcher(
                   duration: const Duration(milliseconds: 200),
                   child: (state is OtpError && !state.isRetryable)
@@ -362,9 +316,7 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
                               Text(
                                 state.message,
                                 style: GoogleFonts.dmSans(
-                                  fontSize: 12,
-                                  color: Colors.red,
-                                ),
+                                    fontSize: 12, color: Colors.red),
                               ),
                             ],
                           ),
@@ -374,14 +326,11 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
 
                 const SizedBox(height: 36),
 
-                // ── Submit button ────────────────────────────────────────
                 AppButton(
                   label: 'Abrir compartimento',
                   onTap: _handleSubmit,
                   loading: state is OtpValidating,
                   icon: Icons.lock_open_rounded,
-                  // AppButton ignores onTap when loading; we also gate on
-                  // canSubmit to disable when fields are incomplete.
                   color: _controller.canSubmit || state is OtpValidating
                       ? AppColors.accent
                       : AC.muted(context),
@@ -389,22 +338,16 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
 
                 const SizedBox(height: 16),
 
-                // ── QR scan shortcut ─────────────────────────────────────
+                // CHANGED: calls _openQrScanner() which pushes QrScannerScreen
+                // instead of showing the stub dialog.
                 if (state is! OtpValidating)
                   TextButton.icon(
-                    onPressed: () async {
-                      final scanned = await _openQrScanner(context);
-                      if (scanned != null && mounted) {
-                        _prefill(scanned);
-                      }
-                    },
+                    onPressed: _openQrScanner,
                     icon: const Icon(Icons.qr_code_scanner_rounded, size: 18),
                     label: Text(
                       'Escanear QR Code do robô',
                       style: GoogleFonts.dmSans(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                      ),
+                          fontSize: 13, fontWeight: FontWeight.w500),
                     ),
                     style: TextButton.styleFrom(
                         foregroundColor: AppColors.accent),
@@ -416,26 +359,267 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
       ),
     );
   }
+}
 
-  // ── QR Scanner stub ───────────────────────────────────────────────────────
-  // Returns a 4-digit string or null if cancelled.
-  // Replace the body with mobile_scanner integration in Phase 3.
-  Future<String?> _openQrScanner(BuildContext context) async {
-    // Phase 3 placeholder — wire mobile_scanner here.
-    // For now, simulate a successful scan so the prefill → auto-submit
-    // pipeline can be tested end-to-end before Phase 3 lands.
-    return showDialog<String>(
-      context: context,
-      builder: (ctx) => _QrScannerStubDialog(),
+// ─── QR SCANNER SCREEN ───────────────────────────────────────────────────────
+//
+// Full-screen camera overlay using mobile_scanner.
+//
+// DESIGN DECISIONS:
+//   1. MobileScannerController is created and disposed within this widget's
+//      lifecycle — no shared controller, no global state.
+//   2. _scanned flag prevents multiple pops if the camera fires the callback
+//      twice before the Navigator transition completes (common on Android).
+//   3. Only barcodes of format QRCode are accepted. The value is validated as
+//      4 ASCII digits before Navigator.pop — invalid QR codes are ignored
+//      with a brief SnackBar, not a dialog (dialogs break the scanner UX).
+//   4. The scanner runs at full screen with a frosted overlay and a cutout
+//      window — no third-party overlay package required.
+
+class QrScannerScreen extends StatefulWidget {
+  const QrScannerScreen({super.key});
+
+  @override
+  State<QrScannerScreen> createState() => _QrScannerScreenState();
+}
+
+class _QrScannerScreenState extends State<QrScannerScreen> {
+  late final MobileScannerController _scannerCtrl;
+  bool _scanned = false; // Guard against double-pop on rapid successive detections.
+
+  @override
+  void initState() {
+    super.initState();
+    _scannerCtrl = MobileScannerController(
+      // Only scan QR codes — ignore barcodes, Data Matrix, etc.
+      formats: [BarcodeFormat.qrCode],
+      // Start with back camera; user can toggle via AppBar icon.
+      facing: CameraFacing.back,
+      // Auto-torch off by default — user can enable manually.
+      torchEnabled: false,
+    );
+  }
+
+  @override
+  void dispose() {
+    _scannerCtrl.dispose();
+    super.dispose();
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    // Guard: ignore subsequent detections after we've already handled one.
+    if (_scanned) return;
+
+    for (final barcode in capture.barcodes) {
+      final raw = barcode.rawValue;
+      if (raw == null) continue;
+
+      // Validate: must be exactly 4 ASCII digit characters.
+      // The robot's QR code encodes only the OTP — no URL wrapping, no prefix.
+      final isValidOtp = raw.length == 4 &&
+          RegExp(r'^\d{4}$').hasMatch(raw);
+
+      if (isValidOtp) {
+        _scanned = true;
+        hapticSuccess();
+        // Pop with the validated code — OtpUnlockScreen._prefill() receives it.
+        Navigator.pop(context, raw);
+        return;
+      }
+
+      // Invalid QR content — surface a non-blocking hint.
+      if (!_scanned) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'QR Code inválido. Aponte para o código do robô.',
+              style: GoogleFonts.dmSans(fontSize: 13, color: Colors.white),
+            ),
+            backgroundColor: Colors.red.shade700,
+            behavior: SnackBarBehavior.floating,
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            margin: const EdgeInsets.all(16),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        title: Text(
+          'Escanear QR Code',
+          style: GoogleFonts.spaceGrotesk(
+              fontSize: 17, fontWeight: FontWeight.w600, color: Colors.white),
+        ),
+        actions: [
+          // Lanterna simplificada
+          IconButton(
+            icon: const Icon(Icons.flash_on_rounded, color: Colors.white),
+            tooltip: 'Lanterna',
+            onPressed: () => _scannerCtrl.toggleTorch(),
+          ),
+          // Trocar câmera
+          IconButton(
+            icon: const Icon(Icons.flip_camera_ios_rounded, color: Colors.white),
+            tooltip: 'Trocar câmera',
+            onPressed: () => _scannerCtrl.switchCamera(),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          // ── Camera feed ────────────────────────────────────────────────
+          MobileScanner(
+            controller: _scannerCtrl,
+            onDetect: _onDetect,
+          ),
+
+          // ── Frosted overlay with cutout window ─────────────────────────
+          // CustomPaint draws a semi-transparent overlay with a transparent
+          // square cutout in the centre, guiding the user's aim.
+          Positioned.fill(
+            child: CustomPaint(
+              painter: _ScannerOverlayPainter(
+                cutoutSize: 240,
+                borderColor: AppColors.accent,
+                overlayColor: Colors.black.withValues(alpha: 0.55),
+              ),
+            ),
+          ),
+
+          // ── Instructions label ─────────────────────────────────────────
+          Positioned(
+            bottom: 80,
+            left: 32,
+            right: 32,
+            child: Column(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 16, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    'Aponte para o QR Code no painel do robô',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.dmSans(
+                      fontSize: 13,
+                      color: Colors.white,
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                // Manual entry fallback — if QR is damaged
+                TextButton(
+                  onPressed: () => Navigator.pop(context, null),
+                  child: Text(
+                    'Digitar código manualmente',
+                    style: GoogleFonts.dmSans(
+                      fontSize: 13,
+                      color: Colors.white60,
+                      decoration: TextDecoration.underline,
+                      decorationColor: Colors.white38,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
 
-// ─── OTP FIELD ROW ───────────────────────────────────────────────────────────
+// ─── SCANNER OVERLAY PAINTER ─────────────────────────────────────────────────
 //
-// Four individual single-digit TextFields.
-// Each field is strictly one character via _SingleDigitFormatter.
-// The fields render as large pill boxes matching the UnBot card aesthetic.
+// Draws a full-screen semi-transparent overlay with:
+//   • A square transparent cutout in the centre (the scan window)
+//   • Rounded accent-coloured corner brackets on the cutout (not a full border
+//     — full borders look cheap; corner brackets are the standard UX pattern)
+
+class _ScannerOverlayPainter extends CustomPainter {
+  final double cutoutSize;
+  final Color borderColor;
+  final Color overlayColor;
+
+  const _ScannerOverlayPainter({
+    required this.cutoutSize,
+    required this.borderColor,
+    required this.overlayColor,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cx = size.width / 2;
+    final cy = size.height / 2;
+    final half = cutoutSize / 2;
+
+    final cutout = Rect.fromLTWH(cx - half, cy - half, cutoutSize, cutoutSize);
+    final cutoutRRect = RRect.fromRectAndRadius(cutout, const Radius.circular(16));
+
+    // ── Semi-transparent overlay (excluding cutout) ────────────────────────
+    final overlayPath = Path()
+      ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
+      ..addRRect(cutoutRRect)
+      ..fillType = PathFillType.evenOdd;
+
+    canvas.drawPath(overlayPath, Paint()..color = overlayColor);
+
+    // ── Corner bracket lines ───────────────────────────────────────────────
+    final bracketPaint = Paint()
+      ..color = borderColor
+      ..strokeWidth = 3.5
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    const bracketLen = 28.0;
+    const r = 16.0; // Matches cutoutRRect radius
+
+    // Top-left
+    canvas.drawLine(Offset(cutout.left + r, cutout.top),
+        Offset(cutout.left + r + bracketLen, cutout.top), bracketPaint);
+    canvas.drawLine(Offset(cutout.left, cutout.top + r),
+        Offset(cutout.left, cutout.top + r + bracketLen), bracketPaint);
+
+    // Top-right
+    canvas.drawLine(Offset(cutout.right - r, cutout.top),
+        Offset(cutout.right - r - bracketLen, cutout.top), bracketPaint);
+    canvas.drawLine(Offset(cutout.right, cutout.top + r),
+        Offset(cutout.right, cutout.top + r + bracketLen), bracketPaint);
+
+    // Bottom-left
+    canvas.drawLine(Offset(cutout.left + r, cutout.bottom),
+        Offset(cutout.left + r + bracketLen, cutout.bottom), bracketPaint);
+    canvas.drawLine(Offset(cutout.left, cutout.bottom - r),
+        Offset(cutout.left, cutout.bottom - r - bracketLen), bracketPaint);
+
+    // Bottom-right
+    canvas.drawLine(Offset(cutout.right - r, cutout.bottom),
+        Offset(cutout.right - r - bracketLen, cutout.bottom), bracketPaint);
+    canvas.drawLine(Offset(cutout.right, cutout.bottom - r),
+        Offset(cutout.right, cutout.bottom - r - bracketLen), bracketPaint);
+  }
+
+  @override
+  bool shouldRepaint(_ScannerOverlayPainter old) =>
+      old.cutoutSize != cutoutSize ||
+      old.borderColor != borderColor ||
+      old.overlayColor != overlayColor;
+}
+
+// ─── OTP FIELD ROW ───────────────────────────────────────────────────────────
 
 class _OtpFieldRow extends StatelessWidget {
   final List<TextEditingController> textCtrls;
@@ -457,7 +641,6 @@ class _OtpFieldRow extends StatelessWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: List.generate(4, (i) {
-        final isLast = i == 3;
         return Row(
           children: [
             _OtpDigitField(
@@ -467,7 +650,7 @@ class _OtpFieldRow extends StatelessWidget {
               hasError: hasError,
               enabled: enabled,
             ),
-            if (!isLast)
+            if (i < 3)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
                 child: Text(
@@ -549,8 +732,6 @@ class _OtpDigitField extends StatelessWidget {
                 fontWeight: FontWeight.w700,
                 color: hasError ? errorColor : AC.primary(context),
               ),
-              // Suppress the default InputDecoration border — our AnimatedContainer
-              // handles the border so we don't get double-border artifacts.
               decoration: const InputDecoration(
                 border: InputBorder.none,
                 enabledBorder: InputBorder.none,
@@ -569,10 +750,6 @@ class _OtpDigitField extends StatelessWidget {
 }
 
 // ─── INPUT FORMATTER ─────────────────────────────────────────────────────────
-//
-// Allows exactly one ASCII digit (0-9) per field.
-// Blocks letters, symbols, and pastes of more than one character.
-// Backspace (empty string) is always allowed — it triggers the retreat logic.
 
 class _SingleDigitFormatter extends TextInputFormatter {
   @override
@@ -580,10 +757,7 @@ class _SingleDigitFormatter extends TextInputFormatter {
     TextEditingValue oldValue,
     TextEditingValue newValue,
   ) {
-    // Always allow clearing the field.
     if (newValue.text.isEmpty) return newValue;
-
-    // Accept only the last character typed (handles rapid paste attempts).
     final lastChar = newValue.text[newValue.text.length - 1];
     if (RegExp(r'[0-9]').hasMatch(lastChar)) {
       return newValue.copyWith(
@@ -591,8 +765,6 @@ class _SingleDigitFormatter extends TextInputFormatter {
         selection: const TextSelection.collapsed(offset: 1),
       );
     }
-
-    // Reject non-digit input — return old value unchanged.
     return oldValue;
   }
 }
@@ -601,7 +773,6 @@ class _SingleDigitFormatter extends TextInputFormatter {
 
 class _SuccessView extends StatelessWidget {
   final String orderId;
-
   const _SuccessView({required this.orderId});
 
   @override
@@ -639,25 +810,18 @@ class _SuccessView extends StatelessWidget {
             Text(
               'Retire sua marmita agora.\nO compartimento fechará automaticamente.',
               style: GoogleFonts.dmSans(
-                fontSize: 14,
-                color: AC.muted(context),
-                height: 1.6,
-              ),
+                  fontSize: 14, color: AC.muted(context), height: 1.6),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
             Text(
               'Pedido ${orderId.length > 6 ? '#${orderId.substring(orderId.length - 6).toUpperCase()}' : orderId.toUpperCase()}',
-              style: GoogleFonts.dmSans(
-                fontSize: 12,
-                color: AC.muted(context),
-              ),
+              style: GoogleFonts.dmSans(fontSize: 12, color: AC.muted(context)),
             ),
             const SizedBox(height: 36),
             AppButton(
               label: 'Voltar ao início',
-              onTap: () =>
-                  Navigator.of(context).popUntil((r) => r.isFirst),
+              onTap: () => Navigator.of(context).popUntil((r) => r.isFirst),
               color: AppColors.teal,
               icon: Icons.home_rounded,
             ),
@@ -672,7 +836,6 @@ class _SuccessView extends StatelessWidget {
 
 class _LockIcon extends StatelessWidget {
   final bool unlocked;
-
   const _LockIcon({required this.unlocked});
 
   @override
@@ -681,10 +844,10 @@ class _LockIcon extends StatelessWidget {
       width: 80,
       height: 80,
       decoration: BoxDecoration(
-        gradient: LinearGradient(
+        gradient: const LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: const [AppColors.accent, AppColors.teal],
+          colors: [AppColors.accent, AppColors.teal],
         ),
         borderRadius: BorderRadius.circular(24),
         boxShadow: [
@@ -700,73 +863,6 @@ class _LockIcon extends StatelessWidget {
         color: Colors.white,
         size: 38,
       ),
-    );
-  }
-}
-
-// ─── QR SCANNER STUB DIALOG ───────────────────────────────────────────────────
-// Phase 3 replaces this with a full-screen mobile_scanner widget.
-// The stub lets the team test the prefill → auto-submit pipeline immediately.
-
-class _QrScannerStubDialog extends StatefulWidget {
-  @override
-  State<_QrScannerStubDialog> createState() => _QrScannerStubDialogState();
-}
-
-class _QrScannerStubDialogState extends State<_QrScannerStubDialog> {
-  final _ctrl = TextEditingController();
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: AC.card(context),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      title: Text(
-        'Simular QR Scan',
-        style: GoogleFonts.spaceGrotesk(
-            fontSize: 16,
-            fontWeight: FontWeight.w700,
-            color: AC.primary(context)),
-      ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            'Phase 3 stub — insira um código de 4 dígitos:',
-            style: GoogleFonts.dmSans(fontSize: 13, color: AC.muted(context)),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _ctrl,
-            keyboardType: TextInputType.number,
-            maxLength: 4,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            style: TextStyle(color: AC.primary(context)),
-            decoration: const InputDecoration(counterText: ''),
-          ),
-        ],
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: Text('Cancelar',
-              style: GoogleFonts.dmSans(color: AC.muted(context))),
-        ),
-        TextButton(
-          onPressed: () {
-            if (_ctrl.text.length == 4) Navigator.pop(context, _ctrl.text);
-          },
-          child: Text('Confirmar',
-              style: GoogleFonts.dmSans(
-                  color: AppColors.accent, fontWeight: FontWeight.w600)),
-        ),
-      ],
     );
   }
 }
