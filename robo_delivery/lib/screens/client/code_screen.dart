@@ -24,6 +24,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'otp_unlock_screen.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/widgets.dart';
 import '../../services/api_service.dart';
@@ -135,6 +136,22 @@ class _CodeScreenState extends State<CodeScreen>
       // FIX #2 — unconditional reset: 503, timeout, or exception all release
       // the guard so the user can retry immediately without restarting the app.
       if (mounted) setState(() => _isValidating = false);
+    }
+  }
+
+  Future<void> _escanearERetirar() async {
+    // 1. Abre a câmera e aguarda a leitura
+    final scannedCode = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => QrScannerScreen(expectedCode: _codeForValidation),
+      ),
+    );
+
+    // 2. Se o usuário escaneou algo e não cancelou, disparamos a validação
+    // O app envia o _codeForValidation que ele já tem guardado na memória.
+    if (scannedCode != null) {
+      await _handleSimularRetirada();
     }
   }
 
@@ -370,11 +387,30 @@ class _CodeScreenState extends State<CodeScreen>
             //
             // FIX #5: success branch now opens the rating sheet.
             if (!_codeUsed)
-              AppButton(
-                label: 'Simular retirada',
-                onTap: _handleSimularRetirada,
-                loading: _isValidating, // FIX #2
-                icon: Icons.lock_open_rounded,
+              Column(
+                children: [
+                  AppButton(
+                    label: 'Escanear Robô e Abrir',
+                    onTap: _escanearERetirar,
+                    loading: _isValidating,
+                    icon: Icons.qr_code_scanner_rounded,
+                  ),
+                  const SizedBox(height: 12),
+                  TextButton.icon(
+                    onPressed: _isValidating ? null : _handleSimularRetirada,
+                    icon: const Icon(Icons.touch_app_rounded, size: 18),
+                    label: Text(
+                      'Simular retirada (Manual)',
+                      style: GoogleFonts.dmSans(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    style: TextButton.styleFrom(
+                      foregroundColor: AppColors.accent,
+                    ),
+                  ),
+                ],
               )
             else
               // FIX #5 — opens modal rating sheet instead of bare navigation.

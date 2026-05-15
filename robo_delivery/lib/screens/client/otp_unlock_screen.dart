@@ -240,7 +240,9 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
   Future<void> _openQrScanner() async {
     final scanned = await Navigator.push<String>(
       context,
-      MaterialPageRoute(builder: (_) => const QrScannerScreen()),
+      MaterialPageRoute(
+        builder: (_) => QrScannerScreen(expectedCode: widget.prefillCode ?? ''),
+      ),
     );
     if (scanned != null && mounted) {
       _prefill(scanned);
@@ -360,39 +362,54 @@ class _OtpUnlockScreenState extends State<OtpUnlockScreen> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QR SCANNER SCREEN
+// QrScannerScreen — mobile_scanner ^5.0.0 compliant
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// THE TORCH LIFECYCLE BUG — root cause and fix (read before modifying):
+// BREAKING CHANGES FROM v4 → v5 (what was removed and what replaces it):
 //
-//   mobile_scanner's MobileScannerController wraps a native AVCaptureSession
-//   (iOS) or CameraX session (Android). The torch is a hardware feature on
-//   that session. Until the session starts, every call to toggleTorch() or
-//   read of torchState fires a platform channel call that has no native object
-//   to talk to → crash.
+//   REMOVED: MobileScannerArguments
+//     The type no longer exists. onScannerStarted was removed from the
+//     MobileScanner widget entirely.
 //
-//   The session starts asynchronously. The first safe moment to interact with
-//   torch state is the `onScannerStarted` callback on the MobileScanner widget,
-//   or the first emission of the `MobileScannerController.torchState` notifier
-//   (which emits TorchState.off once the hardware is ready).
+//   REMOVED: controller.torchState (ValueNotifier<TorchState>)
+//     The separate torchState notifier is gone. Torch state is now a field
+//     inside MobileScannerState, exposed through the controller itself:
+//       controller.value             → MobileScannerState
+//       controller.value.torchState  → TorchState (on | off | unavailable)
 //
-//   FIX:
-//     a) `_cameraReady` bool — set to true inside `onScannerStarted`.
-//     b) Torch IconButton is wrapped in ValueListenableBuilder<TorchState> so
-//        it only rebuilds when the notifier actually emits, and it guards
-//        toggleTorch() behind `if (!_cameraReady) return`.
-//     c) Camera-switch button has the same guard.
+//   REMOVED: onScannerStarted callback on MobileScanner widget
+//     Camera readiness is no longer signalled via a widget callback.
+//     Instead, MobileScannerController is itself a ValueNotifier<MobileScannerState>.
+//     Listen to it to react to any state change, including the transition from
+//     MobileScannerState.stopping/stopped → MobileScannerState.running.
 //
-// DOUBLE-POP GUARD:
-//   Android's MLKit can fire onDetect multiple times per QR frame burst.
-//   `_scanned` bool prevents all but the first valid detection from popping.
+//   REPLACEMENT PATTERN for camera readiness + torch state:
+//     ValueListenableBuilder<MobileScannerState>(
+//       valueListenable: _scannerCtrl,
+//       builder: (context, state, child) {
+//         final isRunning = state.isRunning;           // camera ready guard
+//         final torchOn   = state.torchState == TorchState.on;
+//         ...
+//       },
+//     )
 //
-// VALIDATION:
-//   Only QR codes whose rawValue is exactly 4 ASCII digits are accepted.
-//   Invalid QR codes show a SnackBar and resume scanning — no dialog.
+// LIFECYCLE INVARIANT (unchanged from v4, still applies):
+//   toggleTorch() and switchCamera() are safe to call only when the camera
+//   session is running. In v5 this is expressed as:
+//     if (_scannerCtrl.value.isRunning) _scannerCtrl.toggleTorch();
+//   rather than the old _cameraReady bool + onScannerStarted callback.
+//
+// INTEGRATION:
+//   Drop this class (and its State) into otp_unlock_screen.dart, replacing
+//   the existing QrScannerScreen and _QrScannerScreenState verbatim.
+//   No other classes in that file need to change.
+// ─────────────────────────────────────────────────────────────────────────────
+
 
 class QrScannerScreen extends StatefulWidget {
-  const QrScannerScreen({super.key});
+  final String expectedCode;
+
+  const QrScannerScreen({super.key, required this.expectedCode});
 
   @override
   State<QrScannerScreen> createState() => _QrScannerScreenState();
@@ -401,60 +418,48 @@ class QrScannerScreen extends StatefulWidget {
 class _QrScannerScreenState extends State<QrScannerScreen> {
   late final MobileScannerController _scannerCtrl;
 
-  // ── Lifecycle guards ──────────────────────────────────────────────────────
-  //
-  // _cameraReady: false until onScannerStarted fires. Gates all torch/camera
-  //   interactions to prevent platform channel calls on an uninitialised session.
-  //
-  // _scanned: true after the first valid QR is processed. Prevents double-pop
-  //   from the MLKit burst-detection behaviour on Android.
-  bool _cameraReady = false;
+  // Double-pop guard: MLKit on Android fires onDetect multiple times per
+  // burst. Once we have a valid code and have called Navigator.pop(), we
+  // must ignore every subsequent detection callback.
   bool _scanned = false;
 
   @override
   void initState() {
     super.initState();
+    // v5: Do NOT pass torchEnabled here — torch state is managed through
+    // the controller's ValueNotifier<MobileScannerState> after the session
+    // starts. Passing it in the constructor is a no-op in v5 anyway, but
+    // leaving it out makes the intent unambiguous.
     _scannerCtrl = MobileScannerController(
-      // Only accept QR codes — barcode, Data Matrix, etc. are ignored.
       formats: [BarcodeFormat.qrCode],
-      // Start on the back camera. User can switch via AppBar.
       facing: CameraFacing.back,
-      // FIX: Do NOT pass torchEnabled here. Setting torch state during
-      // controller construction fires a platform channel call before the
-      // native session exists. Let it default to false (off); the user
-      // can toggle it once _cameraReady is true.
-      // torchEnabled: false,  ← removed: was the source of the crash
     );
   }
 
   @override
   void dispose() {
-    // Dispose must happen here, in dispose(), NOT in a finally block inside
-    // the scanner callback. The controller's dispose() call joins the
-    // camera session and must run after the widget is fully unmounted.
+    // stop() + dispose() in sequence: stop() terminates the camera session
+    // cleanly (releases the hardware lock on Android/iOS), then dispose()
+    // frees the Dart-side controller and removes all listeners.
+    // Do NOT call dispose() without stop() first — on some Android devices
+    // this leaves the camera in an acquired state, blocking other apps.
+    _scannerCtrl.stop();
     _scannerCtrl.dispose();
     super.dispose();
   }
 
-  // ── Camera started callback ───────────────────────────────────────────────
-  //
-  // Called by MobileScanner once the native camera session has fully started.
-  // After this fires it is safe to call toggleTorch() and switchCamera().
-  void _onScannerStarted(MobileScannerArguments? args) {
-    if (!mounted) return;
-    setState(() => _cameraReady = true);
-  }
-
   // ── Torch toggle ──────────────────────────────────────────────────────────
+  //
+  // v5 guard: read controller.value.isRunning instead of the old _cameraReady
+  // bool. isRunning is true only while the native camera session is active.
   void _toggleTorch() {
-    // GUARD: Never call platform channel methods before the session is ready.
-    if (!_cameraReady) return;
+    if (!_scannerCtrl.value.isRunning) return;
     _scannerCtrl.toggleTorch();
   }
 
   // ── Camera switch ─────────────────────────────────────────────────────────
   void _switchCamera() {
-    if (!_cameraReady) return;
+    if (!_scannerCtrl.value.isRunning) return;
     _scannerCtrl.switchCamera();
   }
 
@@ -466,21 +471,20 @@ class _QrScannerScreenState extends State<QrScannerScreen> {
       final raw = barcode.rawValue;
       if (raw == null) continue;
 
-      final isValidOtp = raw.length == 4 && RegExp(r'^\d{4}$').hasMatch(raw);
+      final isValidOtp = raw == widget.expectedCode;
 
       if (isValidOtp) {
         _scanned = true;
-        hapticSuccess();
         Navigator.pop(context, raw);
         return;
       }
 
-      // Invalid QR content — non-blocking hint only; do not close the scanner.
+      // Invalid QR content — non-blocking snackbar, scanner keeps running.
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'QR Code inválido. Aponte para o código do robô.',
+              'QR Code inválido. Não corresponde a este pedido.',
               style: GoogleFonts.dmSans(fontSize: 13, color: Colors.white),
             ),
             backgroundColor: Colors.red.shade700,
@@ -505,57 +509,69 @@ class _QrScannerScreenState extends State<QrScannerScreen> {
         title: Text(
           'Escanear QR Code',
           style: GoogleFonts.spaceGrotesk(
-              fontSize: 17, fontWeight: FontWeight.w600, color: Colors.white),
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: Colors.white,
+          ),
         ),
         actions: [
           // ── Torch button ────────────────────────────────────────────────
           //
-          // FIX: ValueListenableBuilder<TorchState> ensures the icon is
-          // always derived from the live notifier state, not a stale snapshot.
-          // The builder will not fire until the native session emits its first
-          // TorchState value, so there is no risk of reading an uninitialised
-          // notifier.
-          ValueListenableBuilder<TorchState>(
-            valueListenable: _scannerCtrl.torchState,
-            builder: (context, torchState, _) {
-              final isOn = torchState == TorchState.on;
+          // v5: Listen to the controller itself (ValueNotifier<MobileScannerState>).
+          // controller.value.torchState replaces the old controller.torchState
+          // ValueNotifier that was removed in v5.
+          //
+          // isRunning gates the button so it is visually disabled (greyed out)
+          // while the camera session is still initialising — same safety
+          // invariant as before, expressed through the v5 API.
+          ValueListenableBuilder<MobileScannerState>(
+            valueListenable: _scannerCtrl,
+            builder: (context, state, _) {
+              final isRunning = state.isRunning;
+              final torchOn = state.torchState == TorchState.on;
+
               return IconButton(
-                // Dim the icon while the camera is still initialising so the
-                // user gets a visual cue that the button is not yet active.
                 icon: Icon(
-                  isOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
-                  color: _cameraReady
-                      ? (isOn ? Colors.yellow : Colors.white)
+                  torchOn
+                      ? Icons.flash_on_rounded
+                      : Icons.flash_off_rounded,
+                  // Dim icon while camera is initialising — communicates
+                  // that the button is not yet active without disabling it
+                  // in a way that breaks the visual rhythm of the AppBar.
+                  color: isRunning
+                      ? (torchOn ? Colors.yellow : Colors.white)
                       : Colors.white38,
                 ),
-                tooltip: isOn ? 'Desligar lanterna' : 'Ligar lanterna',
-                // GUARD: no-op until the session is ready.
-                onPressed: _cameraReady ? _toggleTorch : null,
+                tooltip: torchOn ? 'Desligar lanterna' : 'Ligar lanterna',
+                onPressed: isRunning ? _toggleTorch : null,
               );
             },
           ),
 
           // ── Camera switch button ─────────────────────────────────────────
-          IconButton(
-            icon: Icon(
-              Icons.flip_camera_ios_rounded,
-              color: _cameraReady ? Colors.white : Colors.white38,
-            ),
-            tooltip: 'Trocar câmera',
-            onPressed: _cameraReady ? _switchCamera : null,
+          ValueListenableBuilder<MobileScannerState>(
+            valueListenable: _scannerCtrl,
+            builder: (context, state, _) {
+              return IconButton(
+                icon: Icon(
+                  Icons.flip_camera_ios_rounded,
+                  color: state.isRunning ? Colors.white : Colors.white38,
+                ),
+                tooltip: 'Trocar câmera',
+                onPressed: state.isRunning ? _switchCamera : null,
+              );
+            },
           ),
         ],
       ),
       body: Stack(
         children: [
           // ── Camera feed ──────────────────────────────────────────────────
+          // v5: onScannerStarted is removed from the widget. Camera lifecycle
+          // is observed exclusively through the controller's ValueNotifier.
           MobileScanner(
             controller: _scannerCtrl,
             onDetect: _onDetect,
-            // FIX: onScannerStarted is the authoritative signal that the
-            // native camera session is live. Only after this callback fires
-            // is it safe to call toggleTorch() or switchCamera().
-            onScannerStarted: _onScannerStarted,
           ),
 
           // ── Frosted overlay with cutout ──────────────────────────────────
@@ -569,37 +585,43 @@ class _QrScannerScreenState extends State<QrScannerScreen> {
             ),
           ),
 
-          // ── Status indicator: initialising vs. ready ──────────────────
+          // ── Camera initialising indicator ────────────────────────────────
           //
-          // Shows a subtle loading ring while _cameraReady == false so the
-          // user knows the camera is spinning up and doesn't tap buttons
-          // that would silently fail (or did crash in the old build).
-          if (!_cameraReady)
-            Positioned.fill(
-              child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const SizedBox(
-                      width: 32,
-                      height: 32,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: AppColors.accent,
+          // Shown until controller.value.isRunning becomes true.
+          // ValueListenableBuilder rebuilds automatically on that transition
+          // so the spinner disappears the moment the session is live —
+          // no polling, no Timer, no setState().
+          ValueListenableBuilder<MobileScannerState>(
+            valueListenable: _scannerCtrl,
+            builder: (context, state, _) {
+              if (state.isRunning) return const SizedBox.shrink();
+              return Positioned.fill(
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(
+                        width: 32,
+                        height: 32,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: AppColors.accent,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      'Iniciando câmera...',
-                      style: GoogleFonts.dmSans(
-                          fontSize: 13, color: Colors.white70),
-                    ),
-                  ],
+                      const SizedBox(height: 12),
+                      Text(
+                        'Iniciando câmera...',
+                        style: GoogleFonts.dmSans(
+                            fontSize: 13, color: Colors.white70),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ),
+              );
+            },
+          ),
 
-          // ── Instructions label ───────────────────────────────────────────
+          // ── Instructions + manual entry fallback ─────────────────────────
           Positioned(
             bottom: 80,
             left: 32,
@@ -624,7 +646,6 @@ class _QrScannerScreenState extends State<QrScannerScreen> {
                   ),
                 ),
                 const SizedBox(height: 16),
-                // Manual entry fallback — if QR is damaged or missing
                 TextButton(
                   onPressed: () => Navigator.pop(context, null),
                   child: Text(
@@ -647,9 +668,6 @@ class _QrScannerScreenState extends State<QrScannerScreen> {
 }
 
 // ─── SCANNER OVERLAY PAINTER ─────────────────────────────────────────────────
-//
-// Full-screen semi-transparent overlay with a square transparent cutout and
-// accent-coloured corner brackets. Unchanged from previous revision.
 
 class _ScannerOverlayPainter extends CustomPainter {
   final double cutoutSize;
@@ -688,22 +706,18 @@ class _ScannerOverlayPainter extends CustomPainter {
     const bracketLen = 28.0;
     const r = 16.0;
 
-    // Top-left
     canvas.drawLine(Offset(cutout.left + r, cutout.top),
         Offset(cutout.left + r + bracketLen, cutout.top), bracketPaint);
     canvas.drawLine(Offset(cutout.left, cutout.top + r),
         Offset(cutout.left, cutout.top + r + bracketLen), bracketPaint);
-    // Top-right
     canvas.drawLine(Offset(cutout.right - r, cutout.top),
         Offset(cutout.right - r - bracketLen, cutout.top), bracketPaint);
     canvas.drawLine(Offset(cutout.right, cutout.top + r),
         Offset(cutout.right, cutout.top + r + bracketLen), bracketPaint);
-    // Bottom-left
     canvas.drawLine(Offset(cutout.left + r, cutout.bottom),
         Offset(cutout.left + r + bracketLen, cutout.bottom), bracketPaint);
     canvas.drawLine(Offset(cutout.left, cutout.bottom - r),
         Offset(cutout.left, cutout.bottom - r - bracketLen), bracketPaint);
-    // Bottom-right
     canvas.drawLine(Offset(cutout.right - r, cutout.bottom),
         Offset(cutout.right - r - bracketLen, cutout.bottom), bracketPaint);
     canvas.drawLine(Offset(cutout.right, cutout.bottom - r),
@@ -716,6 +730,7 @@ class _ScannerOverlayPainter extends CustomPainter {
       old.borderColor != borderColor ||
       old.overlayColor != overlayColor;
 }
+
 
 // ─── OTP FIELD ROW ───────────────────────────────────────────────────────────
 
