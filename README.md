@@ -1,89 +1,77 @@
-# UnBot Delivery — ESP32 Firmware (Módulo de Acionamento e Interface)
+# 🤖 UnBot Delivery: Sistema de Logística Autônoma UnB
 
-Este repositório contém o firmware em C++ (Framework Arduino via PlatformIO) responsável por gerenciar a trava física (atuador) e a interface visual do UnBot. Ele atua como um nó IoT edge, recebendo comandos diretos da nuvem AWS via MQTT.
+<img src="./docs/banner.png" width="50%">
 
-## 🚀 Arquitetura e Funcionalidades
+O **UnBot Delivery** é uma solução avançada de logística *last-mile* autônoma desenvolvida para o campus da Universidade de Brasília (UnB). 
 
-* **Conexão Resiliente:** Máquina de estados não-bloqueante (`MqttManager`) que gerencia a conexão Wi-Fi e MQTT simultaneamente. Possui reconexão automática e *backoff* exponencial.
-* **MFA Óptico (Display Dinâmico):** Geração de QR Code em tempo real no display do robô, refletindo o OTP dinâmico do pedido atual para validação via app do cliente.
-* **Validação de Segurança:** Processamento de JSON via `ArduinoJson` (v7) com leitura estrita de memória.
-* **Proteção contra Replay Attacks:** Verifica o campo `issued_at` (Unix Timestamp) para descartar comandos defasados retidos pelo broker.
-* **Telemetria:** Publicação automática de *Heartbeat* (pulso de vida) a cada 30 segundos, informando status, uptime e uso de RAM.
+Este repositório (Monorepo) contém a infraestrutura de software ponta-a-ponta: o aplicativo de pedidos (Flutter), o cérebro transacional e roteamento (Gateway Go), a comunicação via nuvem (MQTT) e o firmware de segurança física da tranca (ESP32 em C++).
 
-## 🔌 Setup de Hardware
+---
 
-O processamento é feito de forma *non-blocking* para garantir que a atualização da tela não congele a recepção de pacotes da rede.
+## 📚 Documentação Arquitetural (Memória do Projeto)
 
-* **Atuador/Trava:** `GPIO 2` (Pino `2`). Ficará em estado `HIGH` por exatamente **5000 ms** (5 segundos) após o comando de abertura validado.
-* **Display (I2C/SPI):** *(Pinos a definir conforme o módulo escolhido pela equipe de hardware)*. Responsável por renderizar o QR Code gerado localmente no microcontrolador.
+Para manter este repositório escalável e facilitar a integração de novos membros (e IAs), toda a complexidade técnica foi isolada na pasta `docs/`. **Leitura obrigatória antes de codar:**
 
-## ⚙️ Dependências (PlatformIO)
+* 🗺️ **[ARCHITECTURE.md](./docs/ARCHITECTURE.md):** Visão geral do sistema, topologia de rede, responsabilidades dos nós e diagrama estrutural.
+* 📜 **[PROTOCOL.md](./docs/PROTOCOL.md):** Contratos de API REST, payloads JSON e mapeamento completo dos tópicos MQTT.
+* 🔄 **[STATE_FLOW.md](./docs/STATE_FLOW.md):** Máquinas de estado, fluxo do MFA Óptico (Renderização Sob Demanda) e tratamento de modo degradado.
+* 📏 **[CONVENTIONS.md](./docs/CONVENTIONS.md):** Nossas regras de ouro de engenharia (ex: proibição de Heap no ESP32, uso de ValueNotifier, Injeção de Dependência no Go).
 
-As dependências são gerenciadas automaticamente pelo `platformio.ini`:
+---
 
-* `knolleary/PubSubClient @ ^2.8.0`
-* `bblanchon/ArduinoJson @ ^7.4.3`
-* `ricmoo/QRCode @ ^0.0.1` *(Nova dependência para geração do QR Code matemático)*
-* *(Dependência do driver do display pendente)*
+## 🛠️ Stack Tecnológica
 
-## 🔐 Configuração Inicial
+| Camada | Tecnologia | Função Principal |
+| :--- | :--- | :--- |
+| **Frontend Mobile** | Flutter (Dart) | App do cliente (Pedidos, Scanner Óptico) e interface de teleoperação. |
+| **Backend Gateway** | Go (Golang) | API REST de alta concorrência e orquestração de entregas. |
+| **Mensageria** | Mosquitto MQTT | Barramento seguro M2M hospedado na nuvem (AWS EC2). |
+| **Firmware (Tranca)** | C++ / PlatformIO | ESP32 com Display OLED (SSD1306) para o MFA Óptico e controle do solenoide. |
+| **Navegação (Core)** | ROS 2 / Raspberry Pi | Nó computacional embarcado no robô (fora deste monorepo de backend/app). |
 
-As credenciais de Wi-Fi e AWS **não estão no controle de versão** por segurança.
-Antes de compilar, você deve criar o arquivo de credenciais:
+---
 
-1. Duplique o arquivo `include/secrets.example.h`.
-2. Renomeie a cópia para `include/secrets.h`.
-3. Preencha as credenciais da rede e do broker Mosquitto:
+## 📂 Estrutura do Monorepo
 
-```cpp
-#pragma once
-#define WIFI_SSID        "Sua_Rede_WiFi"
-#define WIFI_PASSWORD    "Sua_Senha_WiFi"
-
-#define MQTT_BROKER_IP   "IP_DA_AWS_EC2"
-#define MQTT_BROKER_PORT 1883
-#define MQTT_CLIENT_ID   "unbot-esp32-lock-01"
-#define MQTT_USERNAME    "gateway"
-#define MQTT_PASSWORD    "Senha_do_Broker"
-
+```text
+unbot-delivery-system/
+├── mobile/          # Aplicativo Flutter (UI e lógica de cliente)
+├── gateway/         # Servidor Go (API REST e Publicador MQTT)
+├── hardware/
+│   └── esp32-lock/  # Firmware C++ da tranca e display (PlatformIO)
+└── docs/            # Diagramas, contratos e decisões arquiteturais
 ```
 
-## 📡 Contrato de Comunicação (MQTT)
+---
 
-A lógica agora exige dois eventos de recebimento distintos do backend:
+## 🚀 Como Rodar o Projeto (Ambiente Local)
 
-### 1. Atualizar Display (Novo)
-
-Quando o robô chega ao destino, o backend envia a senha para ser gerada como QR Code.
-
-* **Tópico:** `robot/commands/display`
-* **Formato Esperado:**
-
-```json
-{
-  "order_id": "pedido_001",
-  "code": "8134",
-  "action": "show_qr"
-}
-
+### 1. Backend (Go)
+Certifique-se de preencher o `.env` baseado no `.env.example` na pasta `gateway`.
+```bash
+cd gateway
+go run cmd/gateway/main.go
 ```
 
-### 2. Abertura do Compartimento (Unlock)
+### 2. Firmware (ESP32 / Simulador Wokwi)
+Abra a pasta `hardware/esp32-lock` no VS Code com a extensão PlatformIO.
+```bash
+# Compilar o código
+pio run -e esp32dev
 
-Após o cliente escanear o código com sucesso e o Go validar a requisição.
+# Subir para a placa física
+pio run -e esp32dev -t upload
+```
+*(Para simulação, utilize a aba Wokwi apontando para o firmware.elf gerado).*
 
-* **Tópico:** `robot/commands/unlock`
-* **Formato Esperado:**
-
-```json
-{
-  "order_id": "pedido_001",
-  "issued_at": 1778630301
-}
-
+### 3. Frontend (Flutter)
+```bash
+cd mobile
+flutter pub get
+flutter run
 ```
 
-### Publicação (Publish)
+---
 
-* **Tópico:** `robot/status/heartbeat`
-* **Formato:** JSON contendo `source`, `status`, `uptime_s`, `rssi_dbm` e `free_heap_bytes`.
+## 🎓 Créditos
+Desenvolvido como parte do **Projeto Integrador de Tecnologias (PIT)** da Faculdade de Tecnologia (FT) - Engenharia Mecatrônica - Universidade de Brasília (UnB).
