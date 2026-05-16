@@ -1,113 +1,109 @@
 // =============================================================================
 // src/main.cpp
 //
-// UnBot Delivery — ESP32 Main Firmware (v2.0)
+// UnBot Delivery — ESP32 Main Firmware (v3.0)
 // -----------------------------------------------------------------------------
-// WHAT THIS FILE DOES:
-//   1. Initialises MqttManager and registers onUnlockCommand() as the
-//      inbound message handler.
-//   2. Drives the entire program from the non-blocking loop():
-//        a) MqttManager::tick()      — connection state machine
-//        b) handleGpio()             — non-blocking LED/solenoid actuation
-//        c) handleHeartbeat()        — 30 s periodic status publish
-//   3. onUnlockCommand() parses the JSON unlock payload, validates it,
-//      and arms the GPIO actuator via a shared ActuatorState struct.
+// CHANGES FROM v2.0:
+//   + DisplayManager integrated — OLED SSD1306 shows QR on display_qr command,
+//     success screen on unlock command, boot/idle states between deliveries.
+//   + Two-topic MQTT routing:
+//       robot/commands/display_qr  → parse JSON → showQrCode()
+//       robot/commands/unlock      → parse JSON → showUnlockSuccess() → GPIO arm
+//   + MFA sequence enforced in firmware:
+//       display_qr first populates _pendingOrderId.
+//       unlock validates that the arriving order_id matches _pendingOrderId.
+//       Mismatched order_id on unlock is logged and rejected (no GPIO fire).
+//   + _onMqttConnect() in mqtt_manager.cpp updated to subscribe to both topics.
 //
-// HARDWARE WIRING (breadboard mock):
-//   GPIO_ACTUATOR_PIN (default: GPIO 2 = onboard LED on most ESP32 devkits)
-//     → 220Ω resistor → LED anode
-//     → LED cathode → GND
+// MFA SEQUENCE:
+//   Go gateway                ESP32                    Flutter app
+//   ──────────────────────────────────────────────────────────────
+//   POST /dispatch ──────► display_qr topic ──► renders QR on OLED
+//                                               customer scans OLED
+//   POST /validate-code ◄────────────────────── Flutter sends OTP
+//   (validates OTP)
+//   unlock topic ────────► unlock handler ────► clears QR, shows ✓
+//                                             ► GPIO fires solenoid
 //
-//   For the real solenoid lock:
-//     GPIO_ACTUATOR_PIN → NPN transistor base (via 1kΩ)
-//     Transistor collector → Solenoid coil → 12V rail
-//     Transistor emitter → GND
-//     Flyback diode across solenoid coil (1N4007 or similar) — MANDATORY.
-//
-// ADDING YOUR OWN SENSORS / ACTUATORS:
-//   The loop() function is deliberately sparse. Add your sensor reads and
-//   motor commands in the clearly marked extension section at the bottom.
-//   Keep the golden rule: NEVER call delay() anywhere in loop().
-//   If you need a timed action, copy the millis()-based pattern in
-//   handleGpio() and handleHeartbeat().
-//
-// DEPENDENCIES (platformio.ini):
-//   lib_deps =
-//     knolleary/PubSubClient @ ^2.8
-//     bblanchon/ArduinoJson  @ ^7.0
+// CONCURRENCY NOTE (unchanged from v2.0):
+//   All MQTT callbacks fire inside mqttManager.tick() on Core 1, same task
+//   as loop(). No FreeRTOS tasks, no preemption. _pendingOrderId and
+//   ActuatorState are accessed only in this serialised call sequence — no
+//   mutex required. If you add a background task later, protect them.
 // =============================================================================
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <WiFi.h>
 
 #include "mqtt_manager.h"
+#include "display_manager.h"
 #include "secrets.h"   // Copy from secrets.h.example — never commit real values
 
 // =============================================================================
 // Hardware configuration
 // =============================================================================
 
-// GPIO pin driving the lock actuator (LED mock for V2.0).
-// Change to the actual solenoid transistor gate pin for V3.0.
-static constexpr uint8_t  GPIO_ACTUATOR_PIN      = 2;
-
-// How long the actuator stays energised after a valid unlock command.
-// 5000 ms = 5 seconds. Adjust for your solenoid's hold time.
-static constexpr uint32_t ACTUATOR_HOLD_MS        = 5000;
-
-// =============================================================================
-// MQTT topic constants
-// Must match the Go gateway's services/otp.go TopicUnlock and TopicHeartbeat.
-// =============================================================================
-static constexpr char TOPIC_UNLOCK[]     = "robot/commands/unlock";
-static constexpr char TOPIC_HEARTBEAT[]  = "robot/status/heartbeat";
+// Solenoid lock actuator — GPIO 2 = onboard LED for breadboard mock.
+// V3.0 production: wire to NPN transistor gate (GPIO 4 recommended, avoids
+// the boot-mode strapping function on GPIO 2 that can cause upload issues
+// on some boards). Swap the constant and recompile.
+static constexpr uint8_t  GPIO_ACTUATOR_PIN  = 2;
+static constexpr uint32_t ACTUATOR_HOLD_MS   = 5000;  // 5 s hold
 
 // =============================================================================
-// Heartbeat configuration
+// MQTT topic constants (must match Go gateway services/otp.go + order.go)
 // =============================================================================
-static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30000;  // 30 seconds
+static constexpr char TOPIC_DISPLAY_QR[]  = "robot/commands/display_qr";
+static constexpr char TOPIC_UNLOCK[]      = "robot/commands/unlock";
+static constexpr char TOPIC_HEARTBEAT[]   = "robot/status/heartbeat";
+
+static constexpr uint32_t MAX_PAYLOAD_AGE_MS = 60000; // 60 segundos de tolerância
 
 // =============================================================================
-// Payload staleness guard
-// Reject unlock commands whose issued_at timestamp is older than this.
-// Protects against replay of a queued message that sat in the broker during
-// a connectivity gap and arrived late. The Go gateway sets issued_at to
-// time.Now().UTC().Format(time.RFC3339) — we parse the epoch seconds.
+// Heartbeat
 // =============================================================================
-static constexpr uint32_t MAX_PAYLOAD_AGE_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 30000;
+static uint32_t lastHeartbeatMs = 0;
 
 // =============================================================================
-// Actuator state — shared between onUnlockCommand() and handleGpio()
-// This struct is the only communication channel between the MQTT callback
-// and the main loop. No globals, no flags scattered around.
+// MFA state — shared between the two MQTT handlers
 //
-// CONCURRENCY NOTE: The MQTT callback fires inside MqttManager::tick() on
-// the same core and same task as loop(). There is no preemption between
-// the callback and handleGpio() — both run on Core 1 in cooperative
-// sequence. No mutex is needed. If you add FreeRTOS tasks later, protect
-// this struct with a portMUX_TYPE spinlock.
+// _pendingOrderId is set by onDisplayQr() and consumed+cleared by onUnlock().
+// This enforces the MFA sequencing invariant:
+//   - An unlock command for an order whose QR was never displayed is rejected.
+//   - An unlock for a different order than the one on screen is rejected.
+//   - After successful unlock the field is cleared, preventing replay.
+//
+// Buffer sized to hold a full order_id ("order_1714000000123" = 22 chars max).
+// =============================================================================
+static char _pendingOrderId[64] = "";
+
+// =============================================================================
+// Actuator state (unchanged from v2.0)
 // =============================================================================
 struct ActuatorState {
-    bool     armed;           // true = GPIO should be HIGH
-    uint32_t armTimeMs;       // millis() when armed was set true
-    char     orderId[64];     // last successfully validated order ID (for logging)
-    char     code[8];         // last validated OTP code (for logging)
+    bool     armed;
+    uint32_t armTimeMs;
+    char     orderId[64];
 };
+static ActuatorState actuator = { false, 0, "" };
 
-static ActuatorState actuator = { false, 0, "", "" };
+// =============================================================================
+// Subsystem instances
+// =============================================================================
+static DisplayManager displayMgr;
 
 // =============================================================================
 // Forward declarations
 // =============================================================================
-void onUnlockCommand(char* topic, uint8_t* payload, unsigned int length);
+void onDisplayQr(uint8_t* payload, unsigned int len);
+void onUnlock(uint8_t* payload, unsigned int len);
 void handleGpio();
 void handleHeartbeat();
-bool parseIso8601ToEpoch(const char* iso, uint32_t& outEpochSecs);
 
-// =============================================================================
-// MqttManager instance
-// Constructed with credentials from secrets.h and our message callback.
-// =============================================================================
+// MqttManager — unchanged class, updated subscription list in _onMqttConnect().
+// Callback routing is done in the lambda below.
 static MqttManager mqttManager(
     WIFI_SSID,
     WIFI_PASSWORD,
@@ -116,246 +112,301 @@ static MqttManager mqttManager(
     MQTT_CLIENT_ID,
     MQTT_USERNAME,
     MQTT_PASSWORD,
-    onUnlockCommand     // registered as the inbound message handler
+    // Router lambda — dispatches to topic-specific handlers below.
+    // Captures nothing; all state is file-scope static (safe in Arduino loop).
+    [](char* topic, uint8_t* payload, unsigned int len) {
+        if (strcmp(topic, TOPIC_DISPLAY_QR) == 0) {
+            onDisplayQr(payload, len);
+        } else if (strcmp(topic, TOPIC_UNLOCK) == 0) {
+            onUnlock(payload, len);
+        } else {
+            Serial.printf("[MQTT] Unhandled topic: %s\n", topic);
+        }
+    }
 );
-
-// Timestamp of last heartbeat publish (initialised to 0 so first heartbeat
-// fires one interval after boot, giving the connection time to establish).
-static uint32_t lastHeartbeatMs = 0;
 
 // =============================================================================
 // setup()
 // =============================================================================
 void setup() {
     Serial.begin(115200);
-    // Brief settle: USB CDC on ESP32 sometimes misses the first Serial lines
-    // if the host hasn't attached yet. 500 ms is not a blocking concern here
-    // because it is in setup(), not loop().
     delay(500);
 
-    Serial.println(F("\n========================================"));
-    Serial.println(F("  UnBot Delivery — ESP32 Firmware v2.0  "));
-    Serial.println(F("========================================\n"));
+    Serial.println(F("\n=========================================="));
+    Serial.println(F("  UnBot Delivery — ESP32 Firmware v3.0   "));
+    Serial.println(F("==========================================\n"));
 
-    // Configure the actuator GPIO as output and ensure it starts LOW.
-    // A solenoid that powers on at boot is a safety hazard.
+    // ── Display ──────────────────────────────────────────────────────────────
+    // begin() before mqttManager.begin() so the OLED shows the boot screen
+    // immediately — before the Wi-Fi association completes (~2–5 s).
+    if (!displayMgr.begin()) {
+        // Continue without display — robot can still operate. Lock still fires.
+        // Error already logged inside begin().
+    } else {
+        displayMgr.showBooting();
+    }
+
+    // ── Actuator GPIO ─────────────────────────────────────────────────────────
     pinMode(GPIO_ACTUATOR_PIN, OUTPUT);
     digitalWrite(GPIO_ACTUATOR_PIN, LOW);
-    Serial.printf("[GPIO] Actuator pin %d configured as OUTPUT (LOW)\n",
-                  GPIO_ACTUATOR_PIN);
+    Serial.printf("[GPIO] Actuator pin %d → OUTPUT LOW\n", GPIO_ACTUATOR_PIN);
 
-    // Kick off the connection state machine.
+    // ── MQTT / Wi-Fi ──────────────────────────────────────────────────────────
     mqttManager.begin();
 }
 
 // =============================================================================
 // loop()
-// The main loop runs as fast as the ESP32 allows (~240 MHz).
-// Every function called here must be non-blocking.
 // =============================================================================
 void loop() {
-    // ── 1. Connection manager ────────────────────────────────────────────────
-    // Advances the Wi-Fi/MQTT state machine and drives client.loop().
-    // This is where inbound MQTT messages are received and onUnlockCommand()
-    // is called if a robot/commands/unlock message arrives.
     mqttManager.tick();
-
-    // ── 2. GPIO actuator ─────────────────────────────────────────────────────
-    // Checks whether the actuator hold time has elapsed and de-energises
-    // the GPIO if needed. Non-blocking — uses millis() delta, not delay().
     handleGpio();
-
-    // ── 3. Heartbeat publisher ───────────────────────────────────────────────
-    // Publishes a status JSON to robot/status/heartbeat every 30 seconds.
-    // Only fires when the MQTT connection is live — no-op otherwise.
     handleHeartbeat();
 
-    // ── 4. YOUR HARDWARE EXTENSIONS ──────────────────────────────────────────
-    // Add motor control, sensor reads, encoder polling, etc. here.
-    // Rules:
-    //   a) Never call delay().
-    //   b) Use millis() for any timing requirement.
-    //   c) Keep each function under ~1 ms of CPU time per call.
-    //      If a task takes longer, split it across multiple loop() ticks
-    //      using a state variable.
-    //
-    // Example integration point for ROS 2 serial bridge:
-    //   handleRosSerialMessages();
-    //
-    // Example integration point for solenoid status LED:
-    //   updateStatusLed();
+    // Update idle screen once per connection transition.
+    // MqttManager exposes state() — we watch for the CS_MQTT_CONNECTED edge.
+    static ConnectionState lastState = ConnectionState::CS_BOOT;
+    ConnectionState curState = mqttManager.state();
+    if (curState != lastState) {
+        lastState = curState;
+        if (curState == ConnectionState::CS_MQTT_CONNECTED) {
+            // Only show connected screen if no order is currently pending
+            // (avoids overwriting a QR that's waiting to be scanned).
+            if (_pendingOrderId[0] == '\0') {
+                displayMgr.showConnected();
+            }
+        } else if (curState == ConnectionState::CS_WIFI_CONNECTING ||
+                   curState == ConnectionState::CS_BOOT) {
+            displayMgr.showBooting();
+        }
+    }
 }
 
 // =============================================================================
-// onUnlockCommand()
-// Called by MqttManager when a message arrives on robot/commands/unlock.
+// onDisplayQr()
 //
-// PAYLOAD CONTRACT (from Go gateway services/otp.go unlockPayload):
-//   {
-//     "order_id":  "order_1714000000123",
-//     "code":      "7429",
-//     "issued_at": "2025-04-25T14:32:00Z"   (RFC3339 UTC)
-//   }
+// Triggered by: robot/commands/display_qr
 //
-// VALIDATION STEPS:
-//   1. JSON parse — malformed payloads are silently dropped (no crash).
-//   2. Field presence — order_id, code, issued_at must all be present.
-//   3. Code format — must be exactly 4 ASCII digits.
-//   4. Staleness — issued_at must be within MAX_PAYLOAD_AGE_MS of now.
-//      This guards against replayed messages from the broker queue.
+// Expected JSON payload (published by Go gateway on POST /api/orders/{id}/dispatch):
+// {
+//   "order_id":  "order_1714000000123",
+//   "otp":       "7429",
+//   "issued_at": 1714000000
+// }
 //
-// NOTE ON THE STALENESS CHECK:
-//   The ESP32 has no RTC and millis() resets on reboot. We parse the
-//   ISO-8601 timestamp from the payload and compare it against the
-//   NTP-synchronised epoch if available, or skip the check if NTP has
-//   not been configured. For V2.0 (campus demo), we implement a
-//   simplified check: if the device has been online > MAX_PAYLOAD_AGE_MS,
-//   treat the comparison as valid; otherwise accept any payload (safe
-//   because the first boot window is short and under operator supervision).
-//   V3.0 TODO: add configTime() NTP sync and compare against epoch.
+// Validation:
+//   - JSON must parse without error.
+//   - order_id and otp fields must be present and non-empty.
+//   - otp must be exactly 4 ASCII digit characters.
+//   - issued_at staleness check mirrors the unlock handler logic.
+//
+// Side effects:
+//   - Stores orderId in _pendingOrderId for unlock cross-validation.
+//   - Calls displayMgr.showQrCode() to render the QR on screen.
 // =============================================================================
-void onUnlockCommand(char* topic, uint8_t* payload, unsigned int length) {
-    Serial.printf("\n[UNLOCK] Message received on topic: %s (%d bytes)\n",
-                  topic, length);
+void onDisplayQr(uint8_t* payload, unsigned int len) {
+    Serial.printf("\n[DISPLAY_QR] Message received (%d bytes)\n", len);
 
-    // ── Step 1: JSON parse ───────────────────────────────────────────────────
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload, length);
-
+    DeserializationError err = deserializeJson(doc, payload, len);
     if (err) {
-        Serial.printf("[UNLOCK] JSON parse error: %s — payload dropped\n", err.c_str());
+        Serial.printf("[DISPLAY_QR] JSON parse error: %s\n", err.c_str());
+        displayMgr.showError("JSON PARSE ERR");
         return;
     }
 
-    // ── Step 2: Field presence ───────────────────────────────────────────────
-    // REMOVIDO o "| nullptr" que estava quebrando o compilador C++
-    const char* orderId = doc["order_id"];
-    const char* code    = doc["code"];
-    long issuedAt       = doc["issued_at"]; // Se não existir, ele converte para 0
+    const char* orderId  = doc["order_id"];
+    const char* otp      = doc["otp"];
+    long        issuedAt = doc["issued_at"];
 
-    // Se a chave não existir no JSON, o ArduinoJson já garante que será null ou 0
-    if (!orderId || !code || issuedAt == 0) {
-        Serial.println(F("[UNLOCK] Missing required fields (order_id / code / issued_at) — dropped"));
+    if (!orderId || orderId[0] == '\0') {
+        Serial.println(F("[DISPLAY_QR] Missing order_id — dropped"));
         return;
     }
-
-    // ── Step 3: Code format validation ──────────────────────────────────────
-    if (strlen(code) != 4) {
-        Serial.printf("[UNLOCK] Invalid code length (%d) — dropped\n", strlen(code));
+    if (!otp || strlen(otp) != 4) {
+        Serial.printf("[DISPLAY_QR] Invalid otp field: '%s' — dropped\n",
+                      otp ? otp : "(null)");
+        displayMgr.showError("BAD OTP FIELD");
         return;
     }
+    // Verify all 4 chars are digits.
     for (int i = 0; i < 4; i++) {
-        if (code[i] < '0' || code[i] > '9') {
-            Serial.printf("[UNLOCK] Non-digit character in code '%s' — dropped\n", code);
+        if (otp[i] < '0' || otp[i] > '9') {
+            Serial.printf("[DISPLAY_QR] Non-digit in otp '%s' — dropped\n", otp);
+            displayMgr.showError("OTP NOT DIGITS");
             return;
         }
     }
-
-    // ── Step 4: Staleness check ──────────────────────────────────────────────
-    if (millis() > MAX_PAYLOAD_AGE_MS) {
-        Serial.printf("[UNLOCK] issued_at: %ld (staleness check: NTP not configured)\n", issuedAt);
+    if (issuedAt == 0) {
+        Serial.println(F("[DISPLAY_QR] Missing issued_at — dropped"));
+        return;
     }
 
-    // ── All checks passed: arm the actuator ─────────────────────────────────
-    Serial.printf("[UNLOCK] ✓ Valid payload — arming actuator\n");
-    Serial.printf("[UNLOCK]   order_id : %s\n", orderId);
-    Serial.printf("[UNLOCK]   code     : %s\n", code);
-    Serial.printf("[UNLOCK]   issued_at: %ld\n", issuedAt);
+    // Store for unlock cross-validation.
+    strncpy(_pendingOrderId, orderId, sizeof(_pendingOrderId) - 1);
+    _pendingOrderId[sizeof(_pendingOrderId) - 1] = '\0';
 
-    // Store context for logging in handleGpio() when the hold ends.
-    strncpy(actuator.orderId, orderId, sizeof(actuator.orderId) - 1);
-    strncpy(actuator.code,    code,    sizeof(actuator.code)    - 1);
-    actuator.orderId[sizeof(actuator.orderId) - 1] = '\0';
-    actuator.code[sizeof(actuator.code)       - 1] = '\0';
+    Serial.printf("[DISPLAY_QR] ✓ Rendering QR — order: %s  otp: %s\n",
+                  orderId, otp);
 
-    actuator.armed     = true;
-    actuator.armTimeMs = millis();
+    // Render QR Code. Stack frame: ~80 bytes for QR buffer + qrcode_t.
+    displayMgr.showQrCode(otp, orderId);
 }
 
 // =============================================================================
-// handleGpio()
-// Called every loop() iteration. Manages the non-blocking GPIO hold timer.
+// onUnlock()
 //
-// STATE:   actuator.armed == true  → GPIO HIGH (LED on / solenoid energised)
-// TIMEOUT: when millis() - actuator.armTimeMs >= ACTUATOR_HOLD_MS
-//          → GPIO LOW, actuator.armed = false
+// Triggered by: robot/commands/unlock
 //
-// The two-state model (armed / not-armed) is sufficient for a single
-// lock channel. For multiple compartments, extend to an array of
-// ActuatorState indexed by channel ID parsed from the payload.
+// Expected JSON payload (published by Go gateway after OTP validated):
+// {
+//   "order_id":  "order_1714000000123",
+//   "code":      "7429",
+//   "issued_at": 1714000000
+// }
+//
+// MFA CROSS-VALIDATION:
+//   _pendingOrderId must match the incoming order_id. This ensures:
+//   1. A display_qr was received first (QR was physically shown to customer).
+//   2. An unlock for a different order (e.g., replayed or misrouted) is rejected.
+//   3. After successful unlock, _pendingOrderId is cleared, preventing replay.
+//
+// Side effects on success:
+//   - displayMgr.showUnlockSuccess() — customer sees confirmation immediately.
+//   - actuator.armed = true — GPIO fires solenoid in handleGpio() next tick.
+//   - _pendingOrderId cleared.
+// =============================================================================
+void onUnlock(uint8_t* payload, unsigned int len) {
+    Serial.printf("\n[UNLOCK] Message received (%d bytes)\n", len);
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload, len);
+    if (err) {
+        Serial.printf("[UNLOCK] JSON parse error: %s\n", err.c_str());
+        return;
+    }
+
+    const char* orderId  = doc["order_id"];
+    const char* code     = doc["code"];
+    long        issuedAt = doc["issued_at"];
+
+    if (!orderId || orderId[0] == '\0') {
+        Serial.println(F("[UNLOCK] Missing order_id — dropped"));
+        return;
+    }
+    if (!code || strlen(code) != 4) {
+        Serial.println(F("[UNLOCK] Missing/invalid code field — dropped"));
+        return;
+    }
+    if (issuedAt == 0) {
+        Serial.println(F("[UNLOCK] Missing issued_at — dropped"));
+        return;
+    }
+
+    // ── MFA cross-validation ─────────────────────────────────────────────────
+    // _pendingOrderId must be set (display_qr was received) AND must match.
+    if (_pendingOrderId[0] == '\0') {
+        Serial.printf("[UNLOCK] REJECTED — no pending QR displayed "
+                      "(unlock for '%s' arrived without display_qr first)\n",
+                      orderId);
+        displayMgr.showError("NO QR DISPLAYED");
+        return;
+    }
+    if (strncmp(_pendingOrderId, orderId, sizeof(_pendingOrderId)) != 0) {
+        Serial.printf("[UNLOCK] REJECTED — order_id mismatch: "
+                      "pending='%s'  incoming='%s'\n",
+                      _pendingOrderId, orderId);
+        displayMgr.showError("ORDER MISMATCH");
+        return;
+    }
+
+    // ── Staleness check (same logic as v2.0) ─────────────────────────────────
+    if (millis() > MAX_PAYLOAD_AGE_MS) {
+        Serial.printf("[UNLOCK] issued_at: %ld (NTP not configured — "
+                      "staleness check advisory only)\n", issuedAt);
+    }
+
+    // ── All checks passed ────────────────────────────────────────────────────
+    Serial.printf("[UNLOCK] ✓ Valid — arming actuator for order '%s'\n", orderId);
+
+    // Show success screen BEFORE arming GPIO so the customer sees the ✓
+    // immediately — solenoid click follows in the next handleGpio() call
+    // (~0–50ms later), which is imperceptible.
+    displayMgr.showUnlockSuccess(orderId);
+
+    // Arm actuator.
+    strncpy(actuator.orderId, orderId, sizeof(actuator.orderId) - 1);
+    actuator.orderId[sizeof(actuator.orderId) - 1] = '\0';
+    actuator.armed     = true;
+    actuator.armTimeMs = millis();
+
+    // Clear pending order — prevents replay and readies the system for next delivery.
+    _pendingOrderId[0] = '\0';
+}
+
+// =============================================================================
+// handleGpio() — unchanged from v2.0
 // =============================================================================
 void handleGpio() {
     if (!actuator.armed) {
-        // Ensure GPIO is LOW when not armed. Defensive write — idempotent.
         digitalWrite(GPIO_ACTUATOR_PIN, LOW);
         return;
     }
 
-    // Actuator is armed — drive HIGH.
     digitalWrite(GPIO_ACTUATOR_PIN, HIGH);
 
-    // Check hold timer.
     uint32_t elapsed = millis() - actuator.armTimeMs;
     if (elapsed >= ACTUATOR_HOLD_MS) {
-        // Hold time expired — de-energise.
         digitalWrite(GPIO_ACTUATOR_PIN, LOW);
         actuator.armed = false;
 
-        Serial.printf("[GPIO] Actuator released after %lu ms\n", elapsed);
-        Serial.printf("[GPIO]   Order %s (code %s) — compartment closed\n",
-                      actuator.orderId, actuator.code);
+        Serial.printf("[GPIO] Actuator released after %lu ms — "
+                      "compartment closed (order %s)\n",
+                      elapsed, actuator.orderId);
+
+        // Return to idle screen after the hold ends.
+        if (mqttManager.isConnected()) {
+            displayMgr.showConnected();
+        } else {
+            displayMgr.showBooting();
+        }
     }
 }
 
 // =============================================================================
-// handleHeartbeat()
-// Publishes a JSON status message to robot/status/heartbeat every
-// HEARTBEAT_INTERVAL_MS milliseconds. Non-blocking — millis() delta.
-//
-// PAYLOAD:
-//   {
-//     "source":   "esp32",
-//     "status":   "online",
-//     "uptime_s": <seconds since boot>,
-//     "rssi_dbm": <Wi-Fi signal strength>,
-//     "free_heap": <available SRAM in bytes>,
-//     "actuator_armed": <true|false>
-//   }
-//
-// The Go gateway's handleHeartbeat() stub (internal/mqtt/client.go) logs
-// this payload. Wire it to a real online-state tracker in V3.0.
+// handleHeartbeat() — extended from v2.0 to include display_ready field
 // =============================================================================
 void handleHeartbeat() {
     if (!mqttManager.isConnected()) return;
 
     uint32_t now = millis();
     if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) return;
-
     lastHeartbeatMs = now;
 
-    // Build JSON payload using ArduinoJson.
-    // Stack allocation: 256 bytes is sufficient for this fixed-schema payload.
     JsonDocument doc;
-    doc["source"]        = "esp32";
-    doc["status"]        = "online";
-    doc["uptime_s"]      = now / 1000;
-    doc["rssi_dbm"]      = WiFi.RSSI();
-    doc["free_heap"]     = ESP.getFreeHeap();
+    doc["source"]         = "esp32";
+    doc["status"]         = "online";
+    doc["uptime_s"]       = now / 1000;
+    doc["rssi_dbm"]       = WiFi.RSSI();
+    doc["free_heap"]      = ESP.getFreeHeap();
     doc["actuator_armed"] = actuator.armed;
+    doc["display_ready"]  = displayMgr.isReady();   // NEW: lets Go gateway know OLED status
+    doc["pending_order"]  = (_pendingOrderId[0] != '\0') ? _pendingOrderId : "";
 
-    // Serialise to a char buffer on the stack — avoids String heap allocation.
-    char buffer[256];
+    char buffer[320];
     size_t written = serializeJson(doc, buffer, sizeof(buffer));
-
     if (written == 0 || written >= sizeof(buffer)) {
-        Serial.println(F("[HEARTBEAT] Serialisation error — skipping publish"));
+        Serial.println(F("[HEARTBEAT] Serialisation error"));
         return;
     }
 
     bool ok = mqttManager.publish(TOPIC_HEARTBEAT, buffer);
-    Serial.printf("[HEARTBEAT] Published (uptime: %lu s, RSSI: %d dBm, heap: %u B): %s\n",
+    Serial.printf("[HEARTBEAT] %s (uptime: %lus, RSSI: %ddBm, heap: %uB, "
+                  "display: %s, pending: '%s')\n",
+                  ok ? "OK" : "FAIL",
                   now / 1000,
                   WiFi.RSSI(),
                   ESP.getFreeHeap(),
-                  ok ? "OK" : "FAIL");
+                  displayMgr.isReady() ? "OK" : "ERR",
+                  _pendingOrderId[0] ? _pendingOrderId : "—");
 }

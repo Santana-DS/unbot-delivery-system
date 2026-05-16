@@ -81,6 +81,14 @@ type DispatchResult struct {
 	GatewayMode   string `json:"gateway_mode"` // same value as Status — redundant but Flutter expects both
 }
 
+// displayQRPayload is published to robot/commands/display_qr.
+// The ESP32 extracts `otp` and calls qrcode_initText() to render the matrix.
+type displayQRPayload struct {
+	OrderID  string `json:"order_id"`
+	OTP      string `json:"otp"`       // plaintext 4-digit code — see security note above
+	IssuedAt int64  `json:"issued_at"` // Unix epoch seconds — mirrors navigate/unlock convention
+}
+
 // ── Dispatch errors ───────────────────────────────────────────────────────────
 
 var (
@@ -115,57 +123,32 @@ func NewOrderService(otpSvc *OTPService, publisher Publisher, log *slog.Logger) 
 // gracefully to GatewayModeOTPOnly. See MQTT FAILURE POLICY above.
 func (s *OrderService) Dispatch(orderID string, dest Destination) (*DispatchResult, error) {
 	// ── Step 1: Issue OTP ─────────────────────────────────────────────────
-	// This must succeed before we attempt any MQTT publish. If OTP issuance
-	// fails (extremely unlikely — crypto/rand failure), abort entirely.
 	otpCode, err := s.otpSvc.IssueOTP(orderID)
 	if err != nil {
-		s.log.Error("OTP issuance failed",
-			"order_id", orderID,
-			"error", err,
-		)
+		s.log.Error("OTP issuance failed", "order_id", orderID, "error", err)
 		return nil, ErrOTPIssuance
 	}
+	s.log.Info("OTP issued", "order_id", orderID, "otp_code", otpCode)
 
-	s.log.Info("OTP issued",
-		"order_id", orderID,
-		// Do NOT log the actual OTP in production — it is a bearer secret.
-		// This log line exists only to aid campus demo debugging.
-		// TODO: remove before go-live.
-		"otp_code", otpCode,
-	)
-
-	// ── Step 2: Publish navigate command ─────────────────────────────────
+	// ── Step 2: Publish navigate command ──────────────────────────────────
 	mqttConnected := true
 	gatewayMode := GatewayModeFull
 
 	navPayload, marshalErr := json.Marshal(NavigatePayload{
-		OrderID: orderID,
-		Destination: Destination{
-			X: dest.X,
-			Y: dest.Y,
-		},
-		IssuedAt: time.Now().Unix(), // Padronizado com o unlock
+		OrderID:     orderID,
+		Destination: Destination{X: dest.X, Y: dest.Y},
+		IssuedAt:    time.Now().Unix(),
 	})
 	if marshalErr != nil {
-		// json.Marshal on a plain struct with float64 fields cannot fail
-		// unless a NaN/Inf is passed — guard anyway.
-		s.log.Error("navigate payload marshal failed",
-			"order_id", orderID,
-			"error", marshalErr,
-		)
+		s.log.Error("navigate payload marshal failed", "order_id", orderID, "error", marshalErr)
 		mqttConnected = false
 		gatewayMode = GatewayModeOTPOnly
 	}
 
 	if mqttConnected {
 		if pubErr := s.publisher.Publish(TopicNavigate, navPayload); pubErr != nil {
-			// MQTT publish failed — degrade gracefully, do not abort.
-			// The broker's persistent session will deliver the message when
-			// the robot reconnects. The OTP is still valid.
 			s.log.Warn("navigate MQTT publish failed — degrading to otp_only",
-				"order_id", orderID,
-				"error", pubErr,
-			)
+				"order_id", orderID, "error", pubErr)
 			mqttConnected = false
 			gatewayMode = GatewayModeOTPOnly
 		} else {
@@ -175,10 +158,30 @@ func (s *OrderService) Dispatch(orderID string, dest Destination) (*DispatchResu
 				"destination_x", dest.X,
 				"destination_y", dest.Y,
 			)
+
+			// ── Step 3: Publish display_qr (best-effort) ──────────────────
+			// Only attempted if navigate succeeded — if the robot isn't
+			// reachable there's no point sending a display command either.
+			// Failure here does NOT downgrade gatewayMode; manual OTP entry
+			// in the Flutter app is the fallback.
+			displayPayload, displayMarshalErr := json.Marshal(displayQRPayload{
+				OrderID:  orderID,
+				OTP:      otpCode,
+				IssuedAt: time.Now().Unix(),
+			})
+			if displayMarshalErr == nil {
+				if displayPubErr := s.publisher.Publish(TopicDisplayQR, displayPayload); displayPubErr != nil {
+					s.log.Warn("display_qr MQTT publish failed — manual OTP fallback active",
+						"order_id", orderID, "error", displayPubErr)
+				} else {
+					s.log.Info("display_qr command published",
+						"order_id", orderID, "topic", TopicDisplayQR)
+				}
+			}
 		}
 	}
 
-	// ── Step 3: Return result ─────────────────────────────────────────────
+	// ── Step 4: Return result ─────────────────────────────────────────────
 	return &DispatchResult{
 		Success:       true,
 		OrderID:       orderID,

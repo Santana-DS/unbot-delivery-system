@@ -43,6 +43,7 @@ type Publisher interface {
 const (
 	TopicUnlock   = "robot/commands/unlock"
 	TopicNavigate = "robot/commands/navigate"
+	TopicDisplayQR = "robot/commands/display_qr"
 )
 
 // ── OTPRecord ─────────────────────────────────────────────────────────────────

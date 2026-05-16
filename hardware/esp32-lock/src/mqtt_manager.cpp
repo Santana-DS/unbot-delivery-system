@@ -351,26 +351,36 @@ void MqttManager::_attemptMqttConnect() {
 // =============================================================================
 
 void MqttManager::_onMqttConnect() {
-    // CRITICAL: Re-subscribe inside this method, not once at startup.
-    // PubSubClient does not persist subscriptions across disconnects.
-    // Every time _attemptMqttConnect() succeeds this method runs, ensuring
-    // the subscription list is always current regardless of how many times
-    // the board has reconnected.
     Serial.println(F("[MQTT] Subscribing to command topics..."));
 
+    // ── Topic 1: display_qr ───────────────────────────────────────────────
+    // Go gateway publishes here after POST /api/orders/{id}/dispatch succeeds.
+    // The ESP32 renders the OTP as a QR Code on the OLED.
+    // QoS 1: at-least-once delivery. The display is idempotent — showing the
+    // same QR twice is safe and preferable to missing it.
+    bool displaySub = _client.subscribe("robot/commands/display_qr", 1);
+    Serial.printf("[MQTT]   robot/commands/display_qr (QoS 1): %s\n",
+                  displaySub ? "OK" : "FAIL");
+
+    // ── Topic 2: unlock ───────────────────────────────────────────────────
+    // Go gateway publishes here after OTP validated via POST /api/validate-code.
+    // The ESP32 clears the QR, shows the success screen, and fires the GPIO.
+    // QoS 1: at-least-once. The actuator handler is idempotent (re-arming
+    // resets armTimeMs, extending the hold — acceptable in a retry scenario).
     bool unlockSub = _client.subscribe("robot/commands/unlock", 1);
-    Serial.printf("[MQTT]   robot/commands/unlock  (QoS 1): %s\n",
+    Serial.printf("[MQTT]   robot/commands/unlock     (QoS 1): %s\n",
                   unlockSub ? "OK" : "FAIL");
 
-    // Publish an immediate online heartbeat so MQTT Explorer and the Go
-    // gateway know the actuator is live without waiting 30 s for the first
-    // scheduled heartbeat from main.cpp.
+    // ── Online heartbeat ──────────────────────────────────────────────────
+    // Immediate publish so MQTT Explorer and the Go gateway know the actuator
+    // is live without waiting for the first scheduled heartbeat (30 s).
     _client.publish(
         "robot/status/heartbeat",
         "{\"source\":\"esp32\",\"status\":\"online\"}",
-        false  // not retained
+        false
     );
 }
+
 
 void MqttManager::_resetBackoff() {
     _backoffMs = MQTT_BACKOFF_BASE_MS;
