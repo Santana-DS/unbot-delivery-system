@@ -22,6 +22,7 @@ gateway/
 │   │   ├── server.go        # Servidor HTTP e registro de rotas
 │   │   ├── validate.go      # Handler para validação de OTP via MFA
 │   │   └── dispatch.go      # Handler POST /api/orders/{id}/dispatch
+│   │   └── wake_display.go  # Handler POST /api/orders/{id}/wake-display
 │   ├── config/
 │   │   └── config.go        # Carregamento e validação de variáveis de ambiente (.env)
 │   ├── mqtt/
