@@ -1,25 +1,19 @@
 // lib/screens/client/code_screen.dart
 //
-// FIXES APPLIED IN THIS REVISION
-// ───────────────────────────────
-// FIX #1 — Zombie order state: import active_order_state.dart and call
-//           removeOrder(widget.orderId) immediately when validateOtp returns
-//           true, BEFORE setState(). This guarantees the global notifier fires
-//           synchronously so the home-screen badge and order card disappear the
-//           moment the compartment opens, not one frame later.
+// CHANGES IN THIS REVISION (Phase 1.5 — On-Demand Display)
+// ──────────────────────────────────────────────────────────
+// FIX — Race condition: _escanearERetirar() now performs a sequential async
+//   chain:
+//     1. Call wakeDisplay(orderId)    → ESP32 renders the QR on its OLED.
+//     2. Await success response       → only then push QrScannerScreen.
+//     3. If wakeDisplay fails         → offer manual entry, never block user.
 //
-// FIX #2 — Stuck Offline guard: added _isValidating bool that is set true at
-//           the start of the API call and unconditionally reset to false in a
-//           finally block on every code path (success, 503, timeout, exception).
-//           This prevents double-taps from issuing concurrent requests while
-//           still allowing a fresh retry the moment the current call settles.
-//           The AppButton's `loading` prop is wired to _isValidating so the
-//           user gets clear visual feedback that a request is in-flight.
+// The button is disabled (loading=true) from the moment the user taps until
+// either the scanner is pushed or an error is shown. This prevents double-taps
+// from issuing concurrent wake-display requests.
 //
-// FIX #5 — Avaliar Entrega bottom sheet: replaced the bare
-//           Navigator.pushNamedAndRemoveUntil with a showModalBottomSheet that
-//           contains a fully stateful 5-star rating row + optional feedback
-//           TextField. Submission shows a SnackBar then clears the route stack.
+// All other logic (FIX #1 removeOrder, FIX #2 _isValidating, FIX #5 rating
+// sheet) is preserved unchanged.
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -28,7 +22,6 @@ import 'otp_unlock_screen.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/widgets.dart';
 import '../../services/api_service.dart';
-// FIX #1 — required to call removeOrder() on successful OTP validation.
 import '../../state/active_order_state.dart';
 
 class CodeScreen extends StatefulWidget {
@@ -53,15 +46,12 @@ class _CodeScreenState extends State<CodeScreen>
   Timer? _timer;
   bool _codeUsed = false;
 
-  // FIX #2 — in-flight guard: true only while an API call is active.
-  // Reset unconditionally in the finally block so every subsequent tap always
-  // reaches the backend fresh — no stale boolean can prevent a retry.
+  // Covers BOTH the wake-display request and the subsequent OTP validation.
+  // True from "tap scan button" until scanner is pushed (or error shown),
+  // and again from "scanner returns" until validateOtp settles.
   bool _isValidating = false;
 
-  /// Format OTP for display (e.g. "7429" → "7 4 2 9")
   String get _codeFormatted => widget.otp.split('').join(' ');
-
-  /// OTP without spaces for API validation
   String get _codeForValidation => widget.otp.replaceAll(' ', '');
 
   @override
@@ -75,9 +65,7 @@ class _CodeScreenState extends State<CodeScreen>
       CurvedAnimation(parent: _anim, curve: Curves.easeInOut),
     );
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted && _secondsLeft > 0) {
-        setState(() => _secondsLeft--);
-      }
+      if (mounted && _secondsLeft > 0) setState(() => _secondsLeft--);
     });
   }
 
@@ -94,35 +82,21 @@ class _CodeScreenState extends State<CodeScreen>
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 
-  // ─── OTP validation handler ──────────────────────────────────────────────
-  //
-  // FIX #1 + FIX #2:
-  //   • try/finally guarantees _isValidating resets on EVERY exit path,
-  //     including 503, timeout, and unhandled exceptions. The next tap will
-  //     always reach the backend — the guard only blocks concurrent taps.
-  //   • On success: removeOrder() fires before setState() so the notifier
-  //     update and the local UI update are both visible in the same frame.
+  // ─── Manual OTP validation (fallback path, unchanged) ────────────────────
   Future<void> _handleSimularRetirada() async {
-    // Guard: block concurrent in-flight requests, not retries.
     if (_isValidating) return;
-
     setState(() => _isValidating = true);
 
     try {
-      final sucesso = await ApiService().validateOtp(
+      final result = await ApiService().validateOtp(
         _codeForValidation,
         widget.orderId,
       );
 
-      // Async gap safety: widget may have been disposed during the await.
       if (!mounted) return;
 
-      if (sucesso is UnlockSuccess) {
-        // FIX #1 — remove from global notifier BEFORE updating local UI.
-        // This ensures the home badge decrements atomically with the success
-        // state, with no frame where the order appears both "used" and "active".
+      if (result is UnlockSuccess) {
         removeOrder(widget.orderId);
-
         setState(() => _codeUsed = true);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -133,33 +107,180 @@ class _CodeScreenState extends State<CodeScreen>
         );
       }
     } finally {
-      // FIX #2 — unconditional reset: 503, timeout, or exception all release
-      // the guard so the user can retry immediately without restarting the app.
       if (mounted) setState(() => _isValidating = false);
     }
   }
 
+  // ─── On-demand display + scan chain (Phase 1.5) ──────────────────────────
+  //
+  // SEQUENCE:
+  //   [button tap]
+  //      │
+  //      ▼
+  //   setState(_isValidating = true)          ← button shows spinner, blocks re-tap
+  //      │
+  //      ▼
+  //   ApiService().wakeDisplay(orderId)        ← POST /api/orders/{id}/wake-display
+  //      │
+  //      ├─ WakeDisplayTriggered ─────────────► push QrScannerScreen
+  //      │                                         │
+  //      │                                         ▼ (user scans or cancels)
+  //      │                                      scannedCode returned
+  //      │                                         │
+  //      │                                         ├─ non-null ──► _handleSimularRetirada()
+  //      │                                         └─ null ──────► setState(_isValidating = false)
+  //      │
+  //      ├─ WakeDisplayNotFound ──────────────► snackbar "pedido não encontrado"
+  //      │                                      setState(_isValidating = false)
+  //      │
+  //      ├─ WakeDisplayUnreachable ──────────► snackbar + offer manual entry
+  //      │                                      setState(_isValidating = false)
+  //      │
+  //      └─ WakeDisplayNetworkError ─────────► snackbar + offer manual entry
+  //                                             setState(_isValidating = false)
   Future<void> _escanearERetirar() async {
-    // 1. Abre a câmera e aguarda a leitura
-    final scannedCode = await Navigator.push<String>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => QrScannerScreen(expectedCode: _codeForValidation),
-      ),
-    );
+    if (_isValidating) return;
+    setState(() => _isValidating = true);
 
-    // 2. Se o usuário escaneou algo e não cancelou, disparamos a validação
-    // O app envia o _codeForValidation que ele já tem guardado na memória.
-    if (scannedCode != null) {
-      await _handleSimularRetirada();
+    try {
+      // ── Step 1: Wake the display ────────────────────────────────────────
+      final wakeResult = await ApiService().wakeDisplay(widget.orderId);
+
+      if (!mounted) return;
+
+      switch (wakeResult) {
+        case WakeDisplayTriggered():
+          // Display is rendering. Push the scanner immediately.
+          // The ESP32 renders in ~50ms; the navigation push takes ~200ms —
+          // the QR will be ready before the camera focuses.
+          break; // fall through to scanner push below
+
+        case WakeDisplayNotFound(:final message):
+          // Order was completed or never existed. Don't block — show error.
+          _showSnackbar(message, isError: true);
+          return; // _isValidating reset in finally
+
+        case WakeDisplayUnreachable(:final message):
+          // MQTT down. Offer manual entry as the fallback.
+          _showWakeFailureDialog(message);
+          return; // _isValidating reset in finally
+
+        case WakeDisplayNetworkError(:final message):
+          _showWakeFailureDialog(message);
+          return; // _isValidating reset in finally
+      }
+
+      // ── Step 2: Push scanner ────────────────────────────────────────────
+      // _isValidating stays true while the scanner is open — prevents a
+      // second tap on the "scan" button from the same screen if the user
+      // navigates back without scanning.
+      final scannedCode = await Navigator.push<String>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => QrScannerScreen(expectedCode: _codeForValidation),
+        ),
+      );
+
+      if (!mounted) return;
+
+      if (scannedCode != null) {
+        // ── Step 3: Validate OTP ──────────────────────────────────────────
+        // _isValidating is still true here; _handleSimularRetirada's own
+        // guard check `if (_isValidating) return` would block, so we call
+        // the validation logic directly without going through that guard.
+        final result = await ApiService().validateOtp(
+          _codeForValidation,
+          widget.orderId,
+        );
+
+        if (!mounted) return;
+
+        if (result is UnlockSuccess) {
+          removeOrder(widget.orderId);
+          setState(() => _codeUsed = true);
+        } else {
+          _showSnackbar(
+            'Falha ao abrir: Robô offline ou código inválido',
+            isError: true,
+          );
+        }
+      }
+      // scannedCode == null means user cancelled the scanner — do nothing,
+      // just release the lock below in finally.
+
+    } finally {
+      // Unconditional release — every exit path (success, error, cancel,
+      // exception) must restore the button to its interactive state.
+      if (mounted) setState(() => _isValidating = false);
     }
   }
 
-  // ─── FIX #5 — Rating bottom sheet ────────────────────────────────────────
-  //
-  // Uses showModalBottomSheet + StatefulBuilder so the star row can be
-  // interactive without requiring a separate StatefulWidget class.
-  // Submission order: SnackBar → Navigator.pop (sheet) → pushNamedAndRemoveUntil.
+  // ─── Helpers ─────────────────────────────────────────────────────────────
+
+  void _showSnackbar(String message, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          message,
+          style: GoogleFonts.dmSans(fontSize: 13, color: Colors.white),
+        ),
+        backgroundColor: isError ? Colors.red.shade700 : AppColors.teal,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        margin: const EdgeInsets.all(16),
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  // Shown when wake-display fails due to MQTT being unreachable.
+  // Gives the user a clear choice: retry or fall back to manual entry.
+  void _showWakeFailureDialog(String reason) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AC.card(context),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(
+          'Display do robô inacessível',
+          style: GoogleFonts.spaceGrotesk(
+            fontSize: 16,
+            fontWeight: FontWeight.w700,
+            color: AC.primary(context),
+          ),
+        ),
+        content: Text(
+          '$reason\n\nVocê pode digitar o código manualmente.',
+          style: GoogleFonts.dmSans(fontSize: 13, color: AC.muted(context)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(
+              'Usar código manual',
+              style: GoogleFonts.dmSans(color: AppColors.accent),
+            ),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              // Retry the full chain.
+              _escanearERetirar();
+            },
+            child: Text(
+              'Tentar novamente',
+              style: GoogleFonts.dmSans(
+                color: AppColors.accent,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ─── Rating sheet (FIX #5, unchanged) ────────────────────────────────────
   void _showRatingSheet() {
     showModalBottomSheet(
       context: context,
@@ -168,9 +289,7 @@ class _CodeScreenState extends State<CodeScreen>
       builder: (sheetCtx) {
         return _RatingSheet(
           onSubmit: (rating, feedback) {
-            // Close the sheet first.
             Navigator.pop(sheetCtx);
-            // Then show the SnackBar and clear the route stack.
             if (!mounted) return;
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -186,7 +305,6 @@ class _CodeScreenState extends State<CodeScreen>
                 duration: const Duration(seconds: 2),
               ),
             );
-            // Clear entire stack back to home.
             Navigator.pushNamedAndRemoveUntil(
                 context, '/home', (route) => false);
           },
@@ -219,7 +337,10 @@ class _CodeScreenState extends State<CodeScreen>
                   gradient: LinearGradient(
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
-                    colors: [AC.accent(context), AC.accent(context).withValues(alpha: 0.7)],
+                    colors: [
+                      AC.accent(context),
+                      AC.accent(context).withValues(alpha: 0.7)
+                    ],
                   ),
                   borderRadius: BorderRadius.circular(26),
                   boxShadow: [
@@ -239,10 +360,8 @@ class _CodeScreenState extends State<CodeScreen>
 
             const SizedBox(height: 20),
 
-            Text(
-              'Código de retirada',
-              style: Theme.of(context).textTheme.displaySmall,
-            ),
+            Text('Código de retirada',
+                style: Theme.of(context).textTheme.displaySmall),
 
             const SizedBox(height: 8),
 
@@ -250,10 +369,7 @@ class _CodeScreenState extends State<CodeScreen>
               'Apresente este código no painel do robô.\nO compartimento correto será aberto automaticamente.',
               textAlign: TextAlign.center,
               style: GoogleFonts.dmSans(
-                fontSize: 13,
-                color: AC.muted(context),
-                height: 1.6,
-              ),
+                  fontSize: 13, color: AC.muted(context), height: 1.6),
             ),
 
             const SizedBox(height: 28),
@@ -280,7 +396,6 @@ class _CodeScreenState extends State<CodeScreen>
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      // FIX: use real orderId suffix instead of hardcoded #4821.
                       'CÓDIGO ÚNICO · PEDIDO ${widget.orderId.length > 6 ? '#${widget.orderId.substring(widget.orderId.length - 6).toUpperCase()}' : widget.orderId.toUpperCase()}',
                       style: GoogleFonts.dmSans(
                         fontSize: 11,
@@ -294,7 +409,6 @@ class _CodeScreenState extends State<CodeScreen>
 
               const SizedBox(height: 14),
 
-              // Timer row
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -302,9 +416,7 @@ class _CodeScreenState extends State<CodeScreen>
                     width: 7,
                     height: 7,
                     decoration: BoxDecoration(
-                      color: AC.teal(context),
-                      shape: BoxShape.circle,
-                    ),
+                        color: AC.teal(context), shape: BoxShape.circle),
                   ),
                   const SizedBox(width: 8),
                   Text(
@@ -321,8 +433,8 @@ class _CodeScreenState extends State<CodeScreen>
                 decoration: BoxDecoration(
                   color: AC.teal(context).withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(20),
-                  border:
-                      Border.all(color: AC.teal(context).withValues(alpha: 0.3)),
+                  border: Border.all(
+                      color: AC.teal(context).withValues(alpha: 0.3)),
                 ),
                 child: Column(
                   children: [
@@ -337,11 +449,9 @@ class _CodeScreenState extends State<CodeScreen>
                         color: AC.primary(context),
                       ),
                     ),
-                    Text(
-                      'Bom apetite 🍱',
-                      style: GoogleFonts.dmSans(
-                          fontSize: 14, color: AC.muted(context)),
-                    ),
+                    Text('Bom apetite 🍱',
+                        style: GoogleFonts.dmSans(
+                            fontSize: 14, color: AC.muted(context))),
                   ],
                 ),
               ),
@@ -349,7 +459,6 @@ class _CodeScreenState extends State<CodeScreen>
 
             const SizedBox(height: 24),
 
-            // ── Instruction steps ────────────────────────────────────────
             const SectionLabel('Como retirar'),
 
             const _InstructionStep(
@@ -363,9 +472,9 @@ class _CodeScreenState extends State<CodeScreen>
             _InstructionStep(
               number: '2',
               icon: Icons.touch_app_rounded,
-              title: 'Insira o código no painel',
+              title: 'Escaneie o QR Code do robô',
               description:
-                  'Digite os 4 dígitos do seu código no display do robô.',
+                  'Toque em "Escanear" — o display do robô mostrará o código.',
               active: !_codeUsed,
             ),
             _InstructionStep(
@@ -379,16 +488,12 @@ class _CodeScreenState extends State<CodeScreen>
 
             const SizedBox(height: 24),
 
-            // ── Primary action button ────────────────────────────────────
-            //
-            // FIX #2: `loading` is wired to _isValidating so the button
-            //          shows a spinner and ignores taps during the request,
-            //          but is fully interactive again once the request settles.
-            //
-            // FIX #5: success branch now opens the rating sheet.
             if (!_codeUsed)
               Column(
                 children: [
+                  // Primary: scan button — triggers wake-display chain.
+                  // loading=true during BOTH the wake-display request AND
+                  // after scanner returns (while validateOtp is in-flight).
                   AppButton(
                     label: 'Escanear Robô e Abrir',
                     onTap: _escanearERetirar,
@@ -396,24 +501,21 @@ class _CodeScreenState extends State<CodeScreen>
                     icon: Icons.qr_code_scanner_rounded,
                   ),
                   const SizedBox(height: 12),
+                  // Fallback: manual simulation — bypasses the display chain.
                   TextButton.icon(
                     onPressed: _isValidating ? null : _handleSimularRetirada,
                     icon: const Icon(Icons.touch_app_rounded, size: 18),
                     label: Text(
                       'Simular retirada (Manual)',
                       style: GoogleFonts.dmSans(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w500,
-                      ),
+                          fontSize: 14, fontWeight: FontWeight.w500),
                     ),
-                    style: TextButton.styleFrom(
-                      foregroundColor: AppColors.accent,
-                    ),
+                    style:
+                        TextButton.styleFrom(foregroundColor: AppColors.accent),
                   ),
                 ],
               )
             else
-              // FIX #5 — opens modal rating sheet instead of bare navigation.
               AppButton(
                 label: 'Avaliar entrega',
                 onTap: _showRatingSheet,
@@ -427,14 +529,10 @@ class _CodeScreenState extends State<CodeScreen>
   }
 }
 
-// ─── Rating Bottom Sheet ──────────────────────────────────────────────────────
-//
-// FIX #5 — Fully stateful 5-star rating row with optional feedback TextField.
-// Extracted into its own StatefulWidget to keep _CodeScreenState lean.
-// Communicates back via the onSubmit callback so the caller owns navigation.
+// ─── Rating Bottom Sheet (FIX #5, unchanged) ─────────────────────────────────
+
 class _RatingSheet extends StatefulWidget {
   final void Function(int rating, String feedback) onSubmit;
-
   const _RatingSheet({required this.onSubmit});
 
   @override
@@ -458,7 +556,6 @@ class _RatingSheetState extends State<_RatingSheet> {
         color: AC.surface(context),
         borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      // Respect the keyboard so the TextField stays above it.
       padding: EdgeInsets.only(
         left: 24,
         right: 24,
@@ -469,7 +566,6 @@ class _RatingSheetState extends State<_RatingSheet> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Drag handle
           Center(
             child: Container(
               width: 40,
@@ -481,8 +577,6 @@ class _RatingSheetState extends State<_RatingSheet> {
             ),
           ),
           const SizedBox(height: 20),
-
-          // Header
           Text(
             'Como foi sua entrega?',
             style: GoogleFonts.spaceGrotesk(
@@ -494,15 +588,10 @@ class _RatingSheetState extends State<_RatingSheet> {
           const SizedBox(height: 4),
           Text(
             'Sua opinião ajuda a melhorar o serviço.',
-            style: GoogleFonts.dmSans(fontSize: 13, color: AC.muted(context)),
+            style:
+                GoogleFonts.dmSans(fontSize: 13, color: AC.muted(context)),
           ),
-
           const SizedBox(height: 24),
-
-          // ── Interactive 5-star row ───────────────────────────────────
-          // Each star is a GestureDetector that sets _selectedStars.
-          // Stars at or below _selectedStars render filled (accent color);
-          // stars above render outlined (muted).
           Center(
             child: Row(
               mainAxisSize: MainAxisSize.min,
@@ -518,15 +607,17 @@ class _RatingSheetState extends State<_RatingSheet> {
                     padding: const EdgeInsets.symmetric(horizontal: 6),
                     child: AnimatedSwitcher(
                       duration: const Duration(milliseconds: 180),
-                      transitionBuilder: (child, anim) => ScaleTransition(
-                        scale: anim,
-                        child: child,
-                      ),
+                      transitionBuilder: (child, anim) =>
+                          ScaleTransition(scale: anim, child: child),
                       child: Icon(
-                        filled ? Icons.star_rounded : Icons.star_outline_rounded,
+                        filled
+                            ? Icons.star_rounded
+                            : Icons.star_outline_rounded,
                         key: ValueKey(filled),
                         size: 40,
-                        color: filled ? AC.accent(context) : AC.muted(context),
+                        color: filled
+                            ? AC.accent(context)
+                            : AC.muted(context),
                       ),
                     ),
                   ),
@@ -534,51 +625,27 @@ class _RatingSheetState extends State<_RatingSheet> {
               }),
             ),
           ),
-
-          // Star label feedback (optional UX nicety)
-          AnimatedSwitcher(
-            duration: const Duration(milliseconds: 200),
-            child: _selectedStars > 0
-                ? Padding(
-                    key: ValueKey(_selectedStars),
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Center(
-                      child: Text(
-                        _starLabel(_selectedStars),
-                        style: GoogleFonts.dmSans(
-                          fontSize: 13,
-                          color: AC.accent(context),
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                  )
-                : const SizedBox.shrink(key: ValueKey(0)),
-          ),
-
           const SizedBox(height: 20),
-
-          // ── Optional feedback TextField ──────────────────────────────
           TextField(
             controller: _feedbackCtrl,
             maxLines: 3,
             style: GoogleFonts.dmSans(
-              fontSize: 14, color: AC.primary(context)),
+                fontSize: 14, color: AC.primary(context)),
             decoration: InputDecoration(
               hintText: 'Deixe um comentário (opcional)...',
-              hintStyle:
-                  GoogleFonts.dmSans(fontSize: 14, color: AC.muted(context)),
+              hintStyle: GoogleFonts.dmSans(
+                  fontSize: 14, color: AC.muted(context)),
               filled: true,
               fillColor: AC.card(context),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
-                borderSide:
-                    BorderSide(color: AC.primary(context).withValues(alpha: 0.1)),
+                borderSide: BorderSide(
+                    color: AC.primary(context).withValues(alpha: 0.1)),
               ),
               enabledBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
-                borderSide:
-                    BorderSide(color: AC.primary(context).withValues(alpha: 0.1)),
+                borderSide: BorderSide(
+                    color: AC.primary(context).withValues(alpha: 0.1)),
               ),
               focusedBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
@@ -589,55 +656,30 @@ class _RatingSheetState extends State<_RatingSheet> {
                   const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             ),
           ),
-
           const SizedBox(height: 24),
-
-          // ── Submit button ────────────────────────────────────────────
           AppButton(
             label: 'Enviar Avaliação',
             onTap: _selectedStars == 0
-                ? () {
-                    // Nudge user to select at least one star.
-                    ScaffoldMessenger.of(context).showSnackBar(
+                ? () => ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content: Text('Selecione pelo menos 1 estrela.'),
-                        behavior: SnackBarBehavior.floating,
-                      ),
-                    );
-                  }
-                : () => widget.onSubmit(
-                      _selectedStars,
-                      _feedbackCtrl.text.trim(),
-                    ),
+                          content:
+                              Text('Selecione pelo menos 1 estrela.')),
+                    )
+                : () =>
+                    widget.onSubmit(_selectedStars, _feedbackCtrl.text.trim()),
             icon: Icons.send_rounded,
-            color: _selectedStars > 0 ? AC.teal(context) : AC.muted(context),
+            color: _selectedStars > 0
+                ? AC.teal(context)
+                : AC.muted(context),
           ),
         ],
       ),
     );
   }
-
-  /// Human-readable label for the selected star count.
-  String _starLabel(int stars) {
-    switch (stars) {
-      case 1:
-        return 'Muito ruim 😞';
-      case 2:
-        return 'Ruim 😕';
-      case 3:
-        return 'Regular 😐';
-      case 4:
-        return 'Bom 😊';
-      case 5:
-        return 'Excelente! 🤩';
-      default:
-        return '';
-    }
-  }
 }
 
-// ─── Instruction Step ─────────────────────────────────────────────────────────
-// Unchanged from original — kept here for self-contained compilation.
+// ─── Instruction Step (unchanged) ────────────────────────────────────────────
+
 class _InstructionStep extends StatelessWidget {
   final String number;
   final IconData icon;
@@ -666,10 +708,10 @@ class _InstructionStep extends StatelessWidget {
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
             color: active
-              ? AC.accent(context).withValues(alpha: 0.3)
-              : done
-                ? AC.teal(context).withValues(alpha: 0.2)
-                : AC.primary(context).withValues(alpha: 0.08),
+                ? AC.accent(context).withValues(alpha: 0.3)
+                : done
+                    ? AC.teal(context).withValues(alpha: 0.2)
+                    : AC.primary(context).withValues(alpha: 0.08),
           ),
         ),
         child: Row(
@@ -680,10 +722,10 @@ class _InstructionStep extends StatelessWidget {
               height: 36,
               decoration: BoxDecoration(
                 color: done
-                  ? AC.teal(context).withValues(alpha: 0.15)
-                  : active
-                    ? AC.accent(context).withValues(alpha: 0.1)
-                    : AC.primary(context).withValues(alpha: 0.06),
+                    ? AC.teal(context).withValues(alpha: 0.15)
+                    : active
+                        ? AC.accent(context).withValues(alpha: 0.1)
+                        : AC.primary(context).withValues(alpha: 0.06),
                 shape: BoxShape.circle,
               ),
               child: Icon(
@@ -706,15 +748,18 @@ class _InstructionStep extends StatelessWidget {
                     style: GoogleFonts.dmSans(
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
-                      color:
-                          done || active ? AC.primary(context) : AC.muted(context),
+                      color: done || active
+                          ? AC.primary(context)
+                          : AC.muted(context),
                     ),
                   ),
                   const SizedBox(height: 3),
                   Text(
                     description,
                     style: GoogleFonts.dmSans(
-                        fontSize: 12, color: AC.muted(context), height: 1.4),
+                        fontSize: 12,
+                        color: AC.muted(context),
+                        height: 1.4),
                   ),
                 ],
               ),

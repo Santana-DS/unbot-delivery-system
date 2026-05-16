@@ -1,12 +1,8 @@
 // cmd/gateway/main.go
 //
-// Entry point. Wires config → mqtt → services → api → signal handling.
-// No business logic lives here.
-//
-// CHANGES FROM PREVIOUS REVISION
-// ────────────────────────────────
-// - OrderService constructed and injected into api.NewServer alongside OTPService.
-// - api.NewServer signature updated to accept both service dependencies.
+// CHANGES IN THIS REVISION (Phase 1.5):
+//   - WakeDisplayService constructed and injected into api.NewServer.
+//     All other wiring is unchanged.
 package main
 
 import (
@@ -48,25 +44,21 @@ func main() {
 	}
 
 	// ── Service layer ─────────────────────────────────────────────────────
-	// mqtt.Client satisfies services.Publisher via structural (duck) typing.
-	// main.go is the only place that knows about both packages — no import
-	// cycle, no tight coupling between api/mqtt/services.
 	otpSvc := services.NewOTPService(mqtt)
-
-	// ADDED: OrderService owns the dispatch orchestration (IssueOTP + navigate publish).
-	// It shares the same mqtt Publisher and otpSvc so OTPs issued by Dispatch
-	// are immediately available for ValidateAndUnlock.
 	orderSvc := services.NewOrderService(otpSvc, mqtt, log)
+	wakeSvc := services.NewWakeDisplayService(otpSvc, mqtt, log) // NEW
 
 	// ── HTTP server ───────────────────────────────────────────────────────
-	srv := api.NewServer(cfg.HTTPAddr, log, otpSvc, orderSvc)
+	srv := api.NewServer(cfg.HTTPAddr, log, otpSvc, orderSvc, wakeSvc)
 	srv.Start()
 
 	log.Info("gateway ready",
-		"unlock_topic", "robot/commands/unlock",
-		"navigate_topic", "robot/commands/navigate",
-		"validate_endpoint", "POST /api/validate-code",
-		"dispatch_endpoint", "POST /api/orders/{id}/dispatch",
+		"endpoints", []string{
+			"GET  /health",
+			"POST /api/validate-code",
+			"POST /api/orders/{id}/dispatch",
+			"POST /api/orders/{id}/wake-display", // NEW
+		},
 	)
 
 	// ── Block on signal ───────────────────────────────────────────────────

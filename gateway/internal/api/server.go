@@ -1,9 +1,9 @@
 // internal/api/server.go
 //
-// HTTP server. Routes are registered in s.routes() which accepts both
-// *services.OTPService and *services.OrderService so handlers can be
-// wired without global state.
-// All handler logic lives in dedicated files (validate.go, dispatch.go, etc.).
+// CHANGES IN THIS REVISION (Phase 1.5):
+//   - NewServer accepts *services.WakeDisplayService as a fourth parameter.
+//   - routes() registers "POST /api/orders/{id}/wake-display".
+//     All other logic is unchanged.
 package api
 
 import (
@@ -23,21 +23,21 @@ type Server struct {
 	server *http.Server
 }
 
-// NewServer constructs the server and registers all routes. Call Start() to
-// begin listening. Both service dependencies are injected here so route
-// registration can close over them — no package-level state.
+// NewServer constructs the server and registers all routes.
+// CHANGED: wakeSvc added as fourth parameter.
 func NewServer(
 	addr string,
 	log *slog.Logger,
 	otpSvc *services.OTPService,
 	orderSvc *services.OrderService,
+	wakeSvc *services.WakeDisplayService, // NEW
 ) *Server {
 	s := &Server{
 		addr: addr,
 		log:  log,
 		mux:  http.NewServeMux(),
 	}
-	s.routes(otpSvc, orderSvc)
+	s.routes(otpSvc, orderSvc, wakeSvc)
 	s.server = &http.Server{
 		Addr:         addr,
 		Handler:      s.mux,
@@ -62,17 +62,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.server.Shutdown(ctx)
 }
 
-// ── Route registration ────────────────────────────────────────────────────────
-// Go 1.22 method+path patterns: "POST /path" restricts to POST only.
-// {id} is a wildcard segment extracted with r.PathValue("id") in the handler.
-
-func (s *Server) routes(otpSvc *services.OTPService, orderSvc *services.OrderService) {
+// routes registers all HTTP handlers.
+// CHANGED: wake-display route added.
+func (s *Server) routes(
+	otpSvc *services.OTPService,
+	orderSvc *services.OrderService,
+	wakeSvc *services.WakeDisplayService,
+) {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("POST /api/validate-code", s.validateCodeHandler(otpSvc))
-
-	// ADDED: dispatch route — closes over orderSvc.
-	// Pattern uses Go 1.22 method-qualified wildcard syntax.
 	s.mux.HandleFunc("POST /api/orders/{id}/dispatch", s.dispatchHandler(orderSvc))
+	s.mux.HandleFunc("POST /api/orders/{id}/wake-display", s.wakeDisplayHandler(wakeSvc)) // NEW
 }
 
 // ── Health handler ────────────────────────────────────────────────────────────
@@ -87,6 +87,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(healthResponse{
 		Status:  "ok",
-		Version: "2.0.0",
+		Version: "2.1.0",
 	})
 }
