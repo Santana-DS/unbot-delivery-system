@@ -1,0 +1,46 @@
+[Unit]
+Description=UnBot Delivery — Go Gateway
+Documentation=https://github.com/your-org/unbot-delivery
+After=network-online.target mosquitto.service
+Wants=network-online.target
+# If Mosquitto is on a remote EC2 (different instance), remove mosquitto.service
+# from After= and Wants= — the Go process handles MQTT reconnection itself.
+
+[Service]
+Type=simple
+User=unbot
+Group=unbot
+
+# Working directory — binary and env file live here
+WorkingDirectory=/home/ubuntu
+
+# Load environment variables from the renamed .env file.
+# Syntax: KEY=VALUE, one per line, no `export` prefix, no shell expansion.
+EnvironmentFile=/home/ubuntu/.env.unbot
+
+# The binary itself. No shell wrapper — systemd exec's it directly.
+ExecStart=/home/ubuntu/unbot-gateway
+
+# Restart policy: always restart unless we explicitly `systemctl stop` it.
+# on-failure would skip restart on clean exit (code 0) — wrong for a server.
+Restart=always
+RestartSec=5s
+
+# Give the process 10 seconds to drain in-flight requests on SIGTERM.
+# This matches the 10s shutdown context in main.go.
+TimeoutStopSec=15s
+
+# Security hardening — restrict what the process can access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu
+
+# Logging — stdout/stderr go to journald, queryable via `journalctl -u unbot-gateway`
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=unbot-gateway
+
+[Install]
+WantedBy=multi-user.target

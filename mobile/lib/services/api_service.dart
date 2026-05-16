@@ -94,7 +94,7 @@ final class UnlockNetworkError extends UnlockResult {
 // ─── API SERVICE ─────────────────────────────────────────────────────────────
 
 class ApiService {
-  static const String baseUrl = 'http://192.168.15.15:8080';
+  static const String baseUrl = 'http://3.22.171.3:8080';
 
   // ─── wakeDisplay ───────────────────────────────────────────────────────────
   //
